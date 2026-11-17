@@ -462,3 +462,62 @@ fn test_settings_controller_and_indicator_pill() {
     ind.hide(&mut backend);
     assert!(!ind.is_visible());
 }
+
+#[test]
+fn test_record_mode_hides_frozen_screenshot_and_shows_live_transparent_view() {
+    let fonts = Arc::new(FontEngine::load_system_fonts());
+    let mut backend = MockBackend::new(1280, 720);
+    let mut cfg = VexrecConfig::default();
+    cfg.screenshot.last_mode = Some("selection".into());
+    cfg.screenshot.last_region = Some(Rect::new(200, 150, 320, 220));
+
+    let mut overlay = FreezeOverlayController::new(fonts);
+    overlay.show(
+        &mut backend,
+        &cfg,
+        solid_bgra_image(1280, 720, [90, 50, 30, 255]),
+        mock_windows(),
+    );
+
+    // Screenshot mode shows frozen captured desktop pixel inside selection
+    let snap_inside = backend.pixel_bgra(WindowRole::OverlayFullscreen, 300, 220).unwrap();
+    assert_eq!(snap_inside, [90, 50, 30, 255]);
+
+    // Switching to Record hides frozen screenshot: transparent hole inside selection, translucent scrim outside
+    click_pill_button(&mut overlay, &mut backend, PillButtonId::ModeRecord);
+    assert_eq!(overlay.action_mode(), ActionMode::Record);
+
+    let live_inside = backend.pixel_bgra(WindowRole::OverlayFullscreen, 300, 220).unwrap();
+    assert_eq!(
+        live_inside,
+        [0, 0, 0, 0],
+        "Record Selection cutout must be transparent to show live screen"
+    );
+
+    let live_outside = backend.pixel_bgra(WindowRole::OverlayFullscreen, 20, 20).unwrap();
+    assert_eq!(
+        live_outside,
+        [0, 0, 0, 115],
+        "Record Selection exterior should dim live screen without showing frozen desktop"
+    );
+
+    // Switching to Fullscreen in Record mode keeps entire screen transparent (only bottom pill drawn)
+    click_pill_button(&mut overlay, &mut backend, PillButtonId::TargetFullscreen);
+    let live_fs = backend.pixel_bgra(WindowRole::OverlayFullscreen, 20, 20).unwrap();
+    assert_eq!(live_fs, [0, 0, 0, 0]);
+
+    // Switching back to Selection and clicking Record starts recording cleanly
+    click_pill_button(&mut overlay, &mut backend, PillButtonId::TargetSelection);
+    match click_pill_button(&mut overlay, &mut backend, PillButtonId::DoneOrRecord) {
+        OverlayOutcome::StartRecording { crop, .. } => {
+            assert_eq!(crop, Some(Rect::new(200, 150, 320, 220)));
+        }
+        other => panic!("Expected StartRecording with selection crop, got {:?}", other),
+    }
+
+    // Switching back from Record to Screenshot restores frozen screenshot cleanly
+    click_pill_button(&mut overlay, &mut backend, PillButtonId::ModeScreenshot);
+    let restored = backend.pixel_bgra(WindowRole::OverlayFullscreen, 300, 220).unwrap();
+    assert_eq!(restored, [90, 50, 30, 255]);
+}
+

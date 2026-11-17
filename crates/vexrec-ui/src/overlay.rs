@@ -90,6 +90,12 @@ impl FreezeOverlayController {
         }
     }
 
+    pub fn needs_live_window_refresh(&self) -> bool {
+        self.visible
+            && self.action_mode == ActionMode::Record
+            && matches!(self.target_mode, TargetMode::Window | TargetMode::WindowRegion)
+    }
+
     pub fn pill_buttons(&self) -> &[PillButtonRect] {
         &self.pill_buttons
     }
@@ -238,6 +244,43 @@ impl FreezeOverlayController {
         self.present_dirty(backend, None);
         if done {
             self.zoom_start = None;
+        }
+    }
+
+    fn capture_fresh_window_previews(&mut self, backend: &mut dyn DisplayBackend) {
+        for card in &mut self.cards {
+            if let Ok(fresh) = backend.capture_window(card.window.id) {
+                card.window.preview = Some(fresh);
+            }
+        }
+    }
+
+    pub fn refresh_live_windows(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.needs_live_window_refresh() {
+            return;
+        }
+        if let Some(zoom_idx) = self.zoomed_card {
+            if let Some(card) = self.cards.get_mut(zoom_idx) {
+                if let Ok(fresh) = backend.capture_window(card.window.id) {
+                    card.window.preview = Some(fresh);
+                    self.present_dirty(backend, Some(self.zoom_to.outset(8)));
+                }
+            }
+            return;
+        }
+        if self.cards.is_empty() {
+            return;
+        }
+        let mut any_updated = false;
+        for card in &mut self.cards {
+            if let Ok(fresh) = backend.capture_window(card.window.id) {
+                card.window.preview = Some(fresh);
+                any_updated = true;
+            }
+        }
+        if any_updated {
+            let mosaic_area = Rect::new(0, 0, self.screen_w, self.pill_rect.y.max(1) as u32);
+            self.present_dirty(backend, Some(mosaic_area));
         }
     }
 
@@ -528,6 +571,11 @@ impl FreezeOverlayController {
         self.zoom_selection = None;
         self.hovered_card = None;
         self.layout_pill();
+        if self.action_mode == ActionMode::Record
+            && matches!(self.target_mode, TargetMode::Window | TargetMode::WindowRegion)
+        {
+            self.capture_fresh_window_previews(backend);
+        }
         self.present_dirty(backend, None);
     }
 
@@ -548,6 +596,9 @@ impl FreezeOverlayController {
                 if self.action_mode != ActionMode::Record {
                     self.action_mode = ActionMode::Record;
                     self.layout_pill();
+                    if matches!(self.target_mode, TargetMode::Window | TargetMode::WindowRegion) {
+                        self.capture_fresh_window_previews(backend);
+                    }
                     self.present_dirty(backend, None);
                 }
             }
@@ -880,28 +931,43 @@ impl FreezeOverlayController {
         };
         let w = self.screen_w;
         let h = self.screen_h;
+        let is_record = self.action_mode == ActionMode::Record;
 
         match self.target_mode {
             TargetMode::Fullscreen => {
-                // Full screen intentionally draws ZERO border boxes or dimming so the user gets an unobstructed preview
-                self.canvas.blit_desktop_vignette(
-                    &desktop,
-                    Some(Rect::new(0, 0, w, h)),
-                    0,
-                    clip,
-                );
+                // Full screen draws zero border boxes or dimming; in Record mode show live desktop directly
+                if is_record {
+                    self.canvas.clear_transparent(clip);
+                } else {
+                    self.canvas.blit_desktop_vignette(
+                        &desktop,
+                        Some(Rect::new(0, 0, w, h)),
+                        0,
+                        clip,
+                    );
+                }
             }
             TargetMode::Selection => {
                 let active = self.selection.filter(|r| r.width >= 2 && r.height >= 2);
-                self.canvas.blit_desktop_vignette(&desktop, active, 115, clip);
+                if is_record {
+                    self.canvas
+                        .fill_transparent_vignette(active, [0, 0, 0, 115], clip);
+                } else {
+                    self.canvas.blit_desktop_vignette(&desktop, active, 115, clip);
+                }
                 if let Some(r) = active {
                     self.draw_selection_chrome(r, r.width, r.height, clip);
                 }
             }
             TargetMode::Window => {
-                self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
-                self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 130], clip);
-                let title = if self.action_mode == ActionMode::Record {
+                if is_record {
+                    self.canvas
+                        .fill_transparent_vignette(None, [12, 12, 18, 190], clip);
+                } else {
+                    self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
+                    self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 130], clip);
+                }
+                let title = if is_record {
                     "Click a window to record  (Esc to cancel)"
                 } else {
                     "Click a window to capture  (Esc to cancel)"
@@ -909,12 +975,22 @@ impl FreezeOverlayController {
                 self.draw_overview_mosaic(title, clip);
             }
             TargetMode::WindowRegion => {
-                self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
-                self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 145], clip);
+                if is_record {
+                    self.canvas
+                        .fill_transparent_vignette(None, [12, 12, 18, 200], clip);
+                } else {
+                    self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
+                    self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 145], clip);
+                }
                 if let Some(idx) = self.zoomed_card {
                     self.draw_zoomed_window(idx, &desktop, clip);
                 } else {
-                    self.draw_overview_mosaic("Click a window to zoom in & select a region  (Esc to cancel)", clip);
+                    let hint = if is_record {
+                        "Click a window to zoom in & select a region to record  (Esc to cancel)"
+                    } else {
+                        "Click a window to zoom in & select a region  (Esc to cancel)"
+                    };
+                    self.draw_overview_mosaic(hint, clip);
                 }
             }
         }

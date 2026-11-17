@@ -505,8 +505,10 @@ impl X11Display {
         }
 
         let win = self.conn.generate_id().map_err(|e| VexrecError::Display(e.to_string()))?;
-        let use_argb = matches!(role, WindowRole::IndicatorPill | WindowRole::RecordingFrame)
-            && self.argb32_visual.is_some();
+        let use_argb = matches!(
+            role,
+            WindowRole::IndicatorPill | WindowRole::RecordingFrame | WindowRole::OverlayFullscreen
+        ) && self.argb32_visual.is_some();
 
         let (depth, visual, cmap_opt) = if use_argb {
             let (v, c) = self.argb32_visual.unwrap();

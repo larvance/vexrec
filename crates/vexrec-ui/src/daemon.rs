@@ -131,6 +131,7 @@ impl DaemonApp {
         }
 
         let mut events = Events::new();
+        let mut last_live_refresh = std::time::Instant::now();
 
         while self.running {
             self.drain_display_events();
@@ -139,6 +140,12 @@ impl DaemonApp {
 
             if self.overlay.is_animating() {
                 self.overlay.tick(&mut *self.backend);
+            }
+            if self.overlay.needs_live_window_refresh()
+                && last_live_refresh.elapsed() >= Duration::from_millis(40)
+            {
+                self.overlay.refresh_live_windows(&mut *self.backend);
+                last_live_refresh = std::time::Instant::now();
             }
             if let Some(rec) = &self.recorder {
                 self.indicator
@@ -160,6 +167,8 @@ impl DaemonApp {
 
             let timeout = if self.overlay.is_animating() {
                 Some(Duration::from_millis(8))
+            } else if self.overlay.needs_live_window_refresh() {
+                Some(Duration::from_millis(40))
             } else if self.recorder.is_some() {
                 Some(Duration::from_millis(250))
             } else {

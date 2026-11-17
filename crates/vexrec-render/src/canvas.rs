@@ -145,6 +145,69 @@ impl SurfaceCanvas {
         }
     }
 
+    /// Fills the overlay canvas for live Record mode without a frozen screenshot:
+    /// writes premultiplied `scrim_rgba` outside `cutout` and transparent `[0, 0, 0, 0]` inside `cutout`.
+    pub fn fill_transparent_vignette(
+        &mut self,
+        cutout: Option<Rect>,
+        scrim_rgba: [u8; 4],
+        clip: Option<Rect>,
+    ) {
+        let r = self.effective_clip(clip);
+        if r.is_empty() {
+            return;
+        }
+        let dst = self.data.as_mut_slice();
+        let dst_stride = self.stride as usize;
+
+        let rx0 = r.x.max(0);
+        let rx1 = (r.x + r.width as i32).min(self.width as i32);
+        let ry0 = r.y.max(0);
+        let ry1 = (r.y + r.height as i32).min(self.height as i32);
+        if rx1 <= rx0 || ry1 <= ry0 {
+            return;
+        }
+
+        let (cx0, cy0, cx1, cy1) = match cutout {
+            Some(c) if c.width > 0 && c.height > 0 => (
+                c.x.max(rx0),
+                c.y.max(ry0),
+                (c.x + c.width as i32).min(rx1),
+                (c.y + c.height as i32).min(ry1),
+            ),
+            _ => (0, 0, 0, 0),
+        };
+        let has_cutout = cx1 > cx0 && cy1 > cy0;
+
+        let [sr, sg, sb, sa] = scrim_rgba;
+        let pm = |c: u8| -> u8 { ((c as u32 * sa as u32 + 128) * 257 >> 16) as u8 };
+        let scrim_word = u32::from_le_bytes([pm(sb), pm(sg), pm(sr), sa]);
+
+        for py in ry0..ry1 {
+            let d_row = (py as usize) * dst_stride;
+            if has_cutout && py >= cy0 && py < cy1 {
+                if cx0 > rx0 {
+                    fill_u32_span(
+                        &mut dst[d_row + rx0 as usize * 4..d_row + cx0 as usize * 4],
+                        scrim_word,
+                    );
+                }
+                dst[d_row + cx0 as usize * 4..d_row + cx1 as usize * 4].fill(0);
+                if rx1 > cx1 {
+                    fill_u32_span(
+                        &mut dst[d_row + cx1 as usize * 4..d_row + rx1 as usize * 4],
+                        scrim_word,
+                    );
+                }
+            } else {
+                fill_u32_span(
+                    &mut dst[d_row + rx0 as usize * 4..d_row + rx1 as usize * 4],
+                    scrim_word,
+                );
+            }
+        }
+    }
+
     /// Analytical SDF anti-aliased rounded rectangle fill (`rgba` = [R, G, B, A]).
     pub fn fill_rounded_rect(
         &mut self,
@@ -585,5 +648,18 @@ fn force_opaque_bgrx_copy(src: &[u8], dst: &mut [u8]) {
     for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
         let w = u32::from_le_bytes([s[0], s[1], s[2], 255]);
         d.copy_from_slice(&w.to_le_bytes());
+    }
+}
+
+#[inline]
+fn fill_u32_span(dst_row: &mut [u8], word: u32) {
+    let bytes = word.to_le_bytes();
+    let (prefix, aligned, suffix) = unsafe { dst_row.align_to_mut::<u32>() };
+    for chunk in prefix.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&bytes);
+    }
+    aligned.fill(word);
+    for chunk in suffix.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&bytes);
     }
 }
