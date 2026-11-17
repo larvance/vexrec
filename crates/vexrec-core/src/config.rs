@@ -84,8 +84,8 @@ impl VexrecConfig {
     }
 }
 
-fn default_true() -> bool {
-    true
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +95,7 @@ pub struct RecordingConfig {
     pub video_codec: VideoCodec,
     pub quality: VideoQuality,
     pub show_cursor: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_recording_frame: bool,
     pub hardware_accel: bool,
     pub capture_region: Option<Rect>,
@@ -109,7 +109,7 @@ impl Default for RecordingConfig {
             video_codec: VideoCodec::Auto,
             quality: VideoQuality::Medium,
             show_cursor: true,
-            show_recording_frame: true,
+            show_recording_frame: false,
             hardware_accel: true,
             capture_region: None,
         }

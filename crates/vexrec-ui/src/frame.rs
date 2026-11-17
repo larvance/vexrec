@@ -31,7 +31,7 @@ impl RecordingFrameWindow {
             }
         });
 
-        // Draw 3px crimson border with transparent interior
+        // Draw 2px border strictly on outer perimeter without inner glow
         window.connect_draw(|_win, cr| {
             let width = _win.allocated_width() as f64;
             let height = _win.allocated_height() as f64;
@@ -41,17 +41,11 @@ impl RecordingFrameWindow {
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
             let _ = cr.paint();
 
-            // Draw border: 3px red (#ef4444)
+            // Draw outer perimeter border: 2px red (#ef4444)
             cr.set_operator(cairo::Operator::Over);
             cr.set_source_rgba(0.937, 0.267, 0.267, 0.95);
-            cr.set_line_width(3.0);
-            cr.rectangle(1.5, 1.5, width - 3.0, height - 3.0);
-            let _ = cr.stroke();
-
-            // Draw subtle inner glow
-            cr.set_source_rgba(0.937, 0.267, 0.267, 0.25);
-            cr.set_line_width(1.0);
-            cr.rectangle(3.5, 3.5, width - 7.0, height - 7.0);
+            cr.set_line_width(2.0);
+            cr.rectangle(1.0, 1.0, width - 2.0, height - 2.0);
             let _ = cr.stroke();
 
             glib::Propagation::Proceed
@@ -61,26 +55,20 @@ impl RecordingFrameWindow {
     }
 
     pub fn show_frame(&self, crop: Option<Rect>) {
-        const BORDER: i32 = 3;
-        let (x, y, w, h) = match crop {
-            Some(r) => {
-                let px = (r.x - BORDER).max(0);
-                let py = (r.y - BORDER).max(0);
-                let pw = r.width as i32 + 2 * BORDER;
-                let ph = r.height as i32 + 2 * BORDER;
-                (px, py, pw, ph)
-            }
-            None => {
-                let (w, h) = gdk::Display::default()
-                    .and_then(|d| d.primary_monitor().or_else(|| d.monitor(0)))
-                    .map(|m| (m.geometry().width(), m.geometry().height()))
-                    .unwrap_or((1920, 1080));
-                (0, 0, w, h)
-            }
+        // Never show a recording frame for fullscreen recording
+        let Some(r) = crop else {
+            self.window.hide();
+            return;
         };
 
-        self.window.move_(x, y);
-        self.window.resize(w, h);
+        const BORDER: i32 = 4;
+        let px = (r.x - BORDER).max(0);
+        let py = (r.y - BORDER).max(0);
+        let pw = r.width as i32 + 2 * BORDER;
+        let ph = r.height as i32 + 2 * BORDER;
+
+        self.window.move_(px, py);
+        self.window.resize(pw, ph);
         self.window.show_all();
 
         // Re-assert click-through region

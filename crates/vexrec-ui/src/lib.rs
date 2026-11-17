@@ -455,8 +455,10 @@ pub fn run_daemon() {
             }
             UiCommand::ShowRecording { crop, show_frame } => {
                 ind_rcv.show_indicator();
-                if show_frame {
+                if show_frame && crop.is_some() {
                     frame_rcv.show_frame(crop);
+                } else {
+                    frame_rcv.hide_frame();
                 }
             }
             UiCommand::HideRecording => {

@@ -99,6 +99,7 @@ pub struct FreezeOverlayWindow {
     btn_tgt_window: gtk::Button,
     btn_tgt_window_region: gtk::Button,
     btn_tgt_fullscreen: gtk::Button,
+    on_start_recording: Rc<dyn Fn(Option<Rect>, bool, bool)>,
 }
 
 fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -438,6 +439,8 @@ impl FreezeOverlayWindow {
 
         window.add(&overlay_container);
 
+        let on_start_rec_rc: Rc<dyn Fn(Option<Rect>, bool, bool)> = Rc::new(on_start_recording);
+
         let overlay = Rc::new(Self {
             window,
             drawing_area,
@@ -455,6 +458,7 @@ impl FreezeOverlayWindow {
             btn_tgt_window,
             btn_tgt_window_region,
             btn_tgt_fullscreen,
+            on_start_recording: on_start_rec_rc,
         });
 
         // Set up Draw signal
@@ -563,11 +567,18 @@ impl FreezeOverlayWindow {
                 cr.rectangle(0.0, 0.0, win_w, win_h);
                 let _ = cr.fill();
 
-                // Top Header Pill
                 let header_text = if inner.target_mode == TargetMode::Window {
-                    "Click a window to capture"
+                    if inner.action_mode == ActionMode::Record {
+                        "Click a window to record"
+                    } else {
+                        "Click a window to capture"
+                    }
                 } else {
-                    "Click a window to select a region"
+                    if inner.action_mode == ActionMode::Record {
+                        "Click a window to record a region"
+                    } else {
+                        "Click a window to select a region"
+                    }
                 };
                 cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
                 cr.set_font_size(13.0);
@@ -706,7 +717,8 @@ impl FreezeOverlayWindow {
                         hint_title.truncate(32);
                         hint_title.push_str("...");
                     }
-                    let hint_text = format!("Window Region: {} — Esc to Overview", hint_title);
+                    let mode_str = if inner.action_mode == ActionMode::Record { "Record" } else { "Capture" };
+                    let hint_text = format!("{} Region: {} — Esc to Overview", mode_str, hint_title);
                     cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
                     cr.set_font_size(12.0);
                     if let Ok(extents) = cr.text_extents(&hint_text) {
@@ -730,10 +742,7 @@ impl FreezeOverlayWindow {
 
                 // Selection Rect & Handles
                 if inner.target_mode == TargetMode::Fullscreen {
-                    cr.set_source_rgba(0.388, 0.400, 0.945, 0.85);
-                    cr.set_line_width(4.0);
-                    cr.rectangle(0.0, 0.0, win_w, win_h);
-                    let _ = cr.stroke();
+                    // Fullscreen: clean screen preview without any surrounding border box
                 } else if let Some(r) = inner.crop {
                     if r.width > 2 && r.height > 2 {
                         let rx = r.x as f64;
@@ -826,6 +835,14 @@ impl FreezeOverlayWindow {
                     if inner.target_mode == TargetMode::Window {
                         let win = &inner.windows[idx];
                         let win_xid = win.xid;
+                        let srect = win.screen_rect;
+
+                        if inner.action_mode == ActionMode::Record {
+                            drop(inner);
+                            ov_press.trigger_start_recording(Some(srect));
+                            return glib::Propagation::Stop;
+                        }
+
                         let direct_img = win.live_image.clone().or_else(|| {
                             X11CaptureEngine::capture_window(win_xid).ok()
                         });
@@ -835,8 +852,7 @@ impl FreezeOverlayWindow {
                             ov_press.confirm_direct_image(img, true, None);
                             return glib::Propagation::Stop;
                         } else {
-                            let rect = win.screen_rect;
-                            inner.crop = Some(rect);
+                            inner.crop = Some(srect);
                             drop(inner);
                             ov_press.confirm_screenshot(true, None);
                             return glib::Propagation::Stop;
@@ -1102,10 +1118,8 @@ impl FreezeOverlayWindow {
         });
 
         // Keyboard Shortcuts
-        let start_rec_shared = Rc::new(on_start_recording);
         let handle_key = {
             let overlay_key = overlay.clone();
-            let start_rec_key = start_rec_shared.clone();
             Rc::new(move |ev: &gdk::EventKey| -> glib::Propagation {
                 match ev.keyval() {
                     gdk::keys::constants::Escape => {
@@ -1131,23 +1145,26 @@ impl FreezeOverlayWindow {
                             overlay_key.confirm_screenshot(true, None);
                         } else {
                             let crop = overlay_key.get_actual_crop();
-                            let mic = overlay_key.inner.borrow().mic_enabled;
-                            let audio = overlay_key.inner.borrow().desktop_audio_enabled;
-                            overlay_key.cancel();
-                            start_rec_key(crop, mic, audio);
+                            overlay_key.trigger_start_recording(crop);
                         }
                         glib::Propagation::Stop
                     }
                     gdk::keys::constants::c | gdk::keys::constants::C
                         if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
                     {
-                        overlay_key.confirm_screenshot(true, None);
+                        let mode = overlay_key.inner.borrow().action_mode;
+                        if mode == ActionMode::Screenshot {
+                            overlay_key.confirm_screenshot(true, None);
+                        }
                         glib::Propagation::Stop
                     }
                     gdk::keys::constants::s | gdk::keys::constants::S
                         if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
                     {
-                        overlay_key.save_screenshot_as();
+                        let mode = overlay_key.inner.borrow().action_mode;
+                        if mode == ActionMode::Screenshot {
+                            overlay_key.save_screenshot_as();
+                        }
                         glib::Propagation::Stop
                     }
                     gdk::keys::constants::_1 => {
@@ -1190,7 +1207,13 @@ impl FreezeOverlayWindow {
         // Button Click Handlers
         let ov_done = overlay.clone();
         overlay.btn_done.connect_clicked(move |_| {
-            ov_done.confirm_screenshot(true, None);
+            let mode = ov_done.inner.borrow().action_mode;
+            if mode == ActionMode::Screenshot {
+                ov_done.confirm_screenshot(true, None);
+            } else {
+                let crop = ov_done.get_actual_crop();
+                ov_done.trigger_start_recording(crop);
+            }
         });
 
         let ov_save_as = overlay.clone();
@@ -1199,13 +1222,9 @@ impl FreezeOverlayWindow {
         });
 
         let ov_rec = overlay.clone();
-        let start_rec_btn = start_rec_shared.clone();
         overlay.btn_record_action.connect_clicked(move |_| {
             let crop = ov_rec.get_actual_crop();
-            let mic = ov_rec.inner.borrow().mic_enabled;
-            let audio = ov_rec.inner.borrow().desktop_audio_enabled;
-            ov_rec.cancel();
-            start_rec_btn(crop, mic, audio);
+            ov_rec.trigger_start_recording(crop);
         });
 
         let ov_mode_shot = overlay.clone();
@@ -1445,7 +1464,23 @@ impl FreezeOverlayWindow {
         if inner.target_mode == TargetMode::Fullscreen {
             return None;
         }
+        if inner.target_mode == TargetMode::Window {
+            if let Some(idx) = inner.hovered_window {
+                if let Some(win) = inner.windows.get(idx) {
+                    return Some(win.screen_rect);
+                }
+            } else if inner.windows.len() == 1 {
+                return inner.windows.first().map(|w| w.screen_rect);
+            }
+        }
         inner.crop
+    }
+
+    pub fn trigger_start_recording(&self, crop: Option<Rect>) {
+        let mic = self.inner.borrow().mic_enabled;
+        let audio = self.inner.borrow().desktop_audio_enabled;
+        self.cancel();
+        (self.on_start_recording)(crop, mic, audio);
     }
 
     pub fn cancel(&self) {
