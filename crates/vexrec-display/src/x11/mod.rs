@@ -61,11 +61,9 @@ struct X11Atoms {
     net_wm_state_fullscreen: u32,
     net_wm_state_skip_taskbar: u32,
     net_wm_state_skip_pager: u32,
-    net_wm_state_demands_attention: u32,
     net_frame_extents: u32,
     net_wm_name: u32,
     net_wm_icon: u32,
-    net_wm_user_time: u32,
     net_active_window: u32,
     motif_wm_hints: u32,
     wm_protocols: u32,
@@ -80,7 +78,7 @@ struct X11Atoms {
 
 impl X11Atoms {
     fn intern_all(conn: &RustConnection<DefaultStream>) -> Result<Self> {
-        let names: [&[u8]; 28] = [
+        let names: [&[u8]; 26] = [
             b"_NET_CLIENT_LIST",
             b"_NET_WM_PID",
             b"_NET_WM_WINDOW_TYPE",
@@ -94,11 +92,9 @@ impl X11Atoms {
             b"_NET_WM_STATE_FULLSCREEN",
             b"_NET_WM_STATE_SKIP_TASKBAR",
             b"_NET_WM_STATE_SKIP_PAGER",
-            b"_NET_WM_STATE_DEMANDS_ATTENTION",
             b"_NET_FRAME_EXTENTS",
             b"_NET_WM_NAME",
             b"_NET_WM_ICON",
-            b"_NET_WM_USER_TIME",
             b"_NET_ACTIVE_WINDOW",
             b"_MOTIF_WM_HINTS",
             b"WM_PROTOCOLS",
@@ -111,7 +107,7 @@ impl X11Atoms {
             b"image/bmp",
         ];
 
-        // Pipelined atom interning: 1 RTT total for all 28 atoms!
+        // Pipelined atom interning: 1 RTT total for all 26 atoms!
         let mut cookies = Vec::with_capacity(names.len());
         for name in names {
             cookies.push(
@@ -143,21 +139,19 @@ impl X11Atoms {
             net_wm_state_fullscreen: atoms[10],
             net_wm_state_skip_taskbar: atoms[11],
             net_wm_state_skip_pager: atoms[12],
-            net_wm_state_demands_attention: atoms[13],
-            net_frame_extents: atoms[14],
-            net_wm_name: atoms[15],
-            net_wm_icon: atoms[16],
-            net_wm_user_time: atoms[17],
-            net_active_window: atoms[18],
-            motif_wm_hints: atoms[19],
-            wm_protocols: atoms[20],
-            wm_delete_window: atoms[21],
-            clipboard: atoms[22],
-            targets: atoms[23],
-            timestamp: atoms[24],
-            incr: atoms[25],
-            image_png: atoms[26],
-            image_bmp: atoms[27],
+            net_frame_extents: atoms[13],
+            net_wm_name: atoms[14],
+            net_wm_icon: atoms[15],
+            net_active_window: atoms[16],
+            motif_wm_hints: atoms[17],
+            wm_protocols: atoms[18],
+            wm_delete_window: atoms[19],
+            clipboard: atoms[20],
+            targets: atoms[21],
+            timestamp: atoms[22],
+            incr: atoms[23],
+            image_png: atoms[24],
+            image_bmp: atoms[25],
         })
     }
 }
@@ -560,11 +554,9 @@ impl X11Display {
             role,
             WindowRole::RecordingFrame | WindowRole::IndicatorPill | WindowRole::OverlayFullscreen
         ) {
-            // override_redirect=false on OverlayFullscreen lets EWMH/Alt-Tab/focus behave cleanly;
-            // RecordingFrame and IndicatorPill use override_redirect=true for pixel-exact positioning & zero focus steal.
-            if matches!(role, WindowRole::RecordingFrame | WindowRole::IndicatorPill) {
-                aux = aux.override_redirect(1);
-            }
+            // override_redirect=1 prevents WM focus-stealing prevention, panel clamping, or lowering
+            // the freeze capture overlay behind the currently focused window; keyboard is grabbed directly.
+            aux = aux.override_redirect(1);
         }
 
         self.conn
@@ -1233,22 +1225,6 @@ impl DisplayBackend for X11Display {
             None => return,
         };
 
-        if role == WindowRole::OverlayFullscreen {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u32;
-            let _ = self.conn.change_property32(
-                xproto::PropMode::REPLACE,
-                win,
-                self.atoms.net_wm_user_time,
-                xproto::AtomEnum::CARDINAL,
-                &[now_ms],
-            );
-            let _ = self.conn.delete_property(win, self.atoms.net_wm_state_demands_attention);
-        }
-
-        let _ = self.conn.map_window(win);
         let _ = self.conn.configure_window(
             win,
             &xproto::ConfigureWindowAux::new()
@@ -1257,6 +1233,11 @@ impl DisplayBackend for X11Display {
                 .width(geom.width.max(1))
                 .height(geom.height.max(1))
                 .stack_mode(xproto::StackMode::ABOVE),
+        );
+        let _ = self.conn.map_window(win);
+        let _ = self.conn.configure_window(
+            win,
+            &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
         );
         if role == WindowRole::RecordingFrame {
             let _ = shape::rectangles(
@@ -1268,6 +1249,23 @@ impl DisplayBackend for X11Display {
                 0,
                 0,
                 &[],
+            );
+        }
+
+        if role == WindowRole::SettingsDialog {
+            let ev = xproto::ClientMessageEvent {
+                response_type: xproto::CLIENT_MESSAGE_EVENT,
+                format: 32,
+                sequence: 0,
+                window: win,
+                type_: self.atoms.net_active_window,
+                data: xproto::ClientMessageData::from([2, x11rb::CURRENT_TIME, 0, 0, 0]),
+            };
+            let _ = self.conn.send_event(
+                false,
+                self.root,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                ev,
             );
         }
 
@@ -1435,24 +1433,13 @@ impl DisplayBackend for X11Display {
         };
         let win = surf.window;
 
-        // Send EWMH _NET_ACTIVE_WINDOW so GNOME Mutter promotes focus cleanly
-        let ev = xproto::ClientMessageEvent {
-            response_type: xproto::CLIENT_MESSAGE_EVENT,
-            format: 32,
-            sequence: 0,
-            window: win,
-            type_: self.atoms.net_active_window,
-            data: xproto::ClientMessageData::from([2, x11rb::CURRENT_TIME, 0, 0, 0]),
-        };
-        let _ = self.conn.send_event(
-            false,
-            self.root,
-            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
-            ev,
+        let _ = self.conn.configure_window(
+            win,
+            &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
         );
-        let _ = self.conn.set_input_focus(xproto::InputFocus::PARENT, win, x11rb::CURRENT_TIME);
+        let _ = self.conn.flush();
 
-        for attempt in 0..12 {
+        for attempt in 0..20 {
             if let Ok(ck) = self.conn.grab_keyboard(
                 false,
                 win,
@@ -1467,8 +1454,8 @@ impl DisplayBackend for X11Display {
                     }
                 }
             }
-            if attempt < 11 {
-                std::thread::sleep(std::time::Duration::from_millis(12));
+            if attempt < 19 {
+                std::thread::sleep(std::time::Duration::from_millis(6));
             }
         }
         false
