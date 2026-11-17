@@ -207,6 +207,8 @@ pub struct X11Display {
     incr_transfers: HashMap<(u32, u32), IncrTransfer>,
     print_keycode: Option<u8>,
     grabbed_hotkeys: bool,
+    overlay_pointer_grabbed: bool,
+    overlay_cursor: CursorKind,
     kbd_mapping: Option<(u8, u8, Vec<u32>)>, // (min_kc, syms_per_kc, keysyms)
 }
 
@@ -359,6 +361,8 @@ impl X11Display {
             incr_transfers: HashMap::new(),
             print_keycode,
             grabbed_hotkeys: false,
+            overlay_pointer_grabbed: false,
+            overlay_cursor: CursorKind::Default,
             kbd_mapping,
         };
 
@@ -541,6 +545,7 @@ impl X11Display {
                     | xproto::EventMask::BUTTON_PRESS
                     | xproto::EventMask::BUTTON_RELEASE
                     | xproto::EventMask::POINTER_MOTION
+                    | xproto::EventMask::LEAVE_WINDOW
                     | xproto::EventMask::STRUCTURE_NOTIFY
             }
         };
@@ -1413,7 +1418,7 @@ impl DisplayBackend for X11Display {
     }
 
     fn set_cursor(&mut self, role: WindowRole, cursor: CursorKind) {
-        let Some(surf) = self.surfaces.get(&role) else {
+        let Some(win) = self.surfaces.get(&role).map(|s| s.window) else {
             return;
         };
         let cur_id = self
@@ -1422,10 +1427,20 @@ impl DisplayBackend for X11Display {
             .copied()
             .or_else(|| self.cursors.get(&CursorKind::Default).copied())
             .unwrap_or(x11rb::NONE);
+        if role == WindowRole::OverlayFullscreen {
+            self.overlay_cursor = cursor;
+        }
         let _ = self.conn.change_window_attributes(
-            surf.window,
+            win,
             &xproto::ChangeWindowAttributesAux::new().cursor(cur_id),
         );
+        if role == WindowRole::OverlayFullscreen && self.overlay_pointer_grabbed {
+            let _ = self.conn.change_active_pointer_grab(
+                cur_id,
+                x11rb::CURRENT_TIME,
+                overlay_pointer_grab_mask(),
+            );
+        }
         let _ = self.conn.flush();
     }
 
@@ -1441,29 +1456,68 @@ impl DisplayBackend for X11Display {
         );
         let _ = self.conn.flush();
 
+        let cur_id = self
+            .cursors
+            .get(&self.overlay_cursor)
+            .copied()
+            .or_else(|| self.cursors.get(&CursorKind::Default).copied())
+            .unwrap_or(x11rb::NONE);
+        let ptr_mask = overlay_pointer_grab_mask();
+        let mut kbd_ok = false;
+        self.overlay_pointer_grabbed = false;
+
+        // Grab both keyboard and pointer (owner_events=false) so compositor overlay windows
+        // such as GNOME Shell's panel/dock ShapeInput rects cannot intercept pill hover or clicks.
         for attempt in 0..20 {
-            if let Ok(ck) = self.conn.grab_keyboard(
-                false,
-                win,
-                x11rb::CURRENT_TIME,
-                xproto::GrabMode::ASYNC,
-                xproto::GrabMode::ASYNC,
-            ) {
-                if let Ok(rep) = ck.reply() {
-                    if rep.status == xproto::GrabStatus::SUCCESS {
-                        debug!(attempt, "Acquired immediate X11 overlay keyboard grab");
-                        return true;
+            if !kbd_ok {
+                if let Ok(ck) = self.conn.grab_keyboard(
+                    false,
+                    win,
+                    x11rb::CURRENT_TIME,
+                    xproto::GrabMode::ASYNC,
+                    xproto::GrabMode::ASYNC,
+                ) {
+                    if let Ok(rep) = ck.reply() {
+                        if rep.status == xproto::GrabStatus::SUCCESS {
+                            kbd_ok = true;
+                        }
                     }
                 }
+            }
+            if !self.overlay_pointer_grabbed {
+                if let Ok(ck) = self.conn.grab_pointer(
+                    false,
+                    win,
+                    ptr_mask,
+                    xproto::GrabMode::ASYNC,
+                    xproto::GrabMode::ASYNC,
+                    x11rb::NONE,
+                    cur_id,
+                    x11rb::CURRENT_TIME,
+                ) {
+                    if let Ok(rep) = ck.reply() {
+                        if rep.status == xproto::GrabStatus::SUCCESS {
+                            self.overlay_pointer_grabbed = true;
+                        }
+                    }
+                }
+            }
+            if kbd_ok && self.overlay_pointer_grabbed {
+                debug!(attempt, "Acquired immediate X11 overlay keyboard and pointer grab");
+                return true;
             }
             if attempt < 19 {
                 std::thread::sleep(std::time::Duration::from_millis(6));
             }
         }
-        false
+        kbd_ok
     }
 
     fn ungrab_overlay_keyboard(&mut self) {
+        if self.overlay_pointer_grabbed {
+            let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+            self.overlay_pointer_grabbed = false;
+        }
         let _ = self.conn.ungrab_keyboard(x11rb::CURRENT_TIME);
         let _ = self.conn.flush();
     }
@@ -1729,6 +1783,13 @@ impl X11Display {
         }
         Some(img)
     }
+}
+
+#[inline]
+fn overlay_pointer_grab_mask() -> xproto::EventMask {
+    xproto::EventMask::BUTTON_PRESS
+        | xproto::EventMask::BUTTON_RELEASE
+        | xproto::EventMask::POINTER_MOTION
 }
 
 fn test_shm_attach_fd(conn: &RustConnection<DefaultStream>) -> bool {

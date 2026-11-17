@@ -521,3 +521,75 @@ fn test_record_mode_hides_frozen_screenshot_and_shows_live_transparent_view() {
     assert_eq!(restored, [90, 50, 30, 255]);
 }
 
+#[test]
+fn test_hover_over_pill_and_settings_button_text_centers() {
+    let fonts = Arc::new(FontEngine::load_system_fonts());
+    let mut backend = MockBackend::new(1920, 1080);
+    let cfg = VexrecConfig::default();
+
+    let mut overlay = FreezeOverlayController::new(fonts.clone());
+    overlay.show(
+        &mut backend,
+        &cfg,
+        solid_bgra_image(1920, 1080, [32, 32, 36, 255]),
+        mock_windows(),
+    );
+
+    // Every pill button must activate CursorKind::Pointer at its exact text center (b.rect center & baseline-4)
+    let buttons = overlay.pill_buttons().to_vec();
+    assert!(!buttons.is_empty());
+    for btn in &buttons {
+        let base_corner = backend
+            .pixel_bgra(WindowRole::OverlayFullscreen, btn.rect.x + 3, btn.rect.y + 4)
+            .unwrap();
+
+        let text_cx = btn.rect.x as f64 + btn.rect.width as f64 * 0.5;
+        let text_cy = btn.rect.y as f64 + 14.0;
+        overlay.on_pointer_motion(&mut backend, text_cx, text_cy);
+        assert_eq!(
+            backend.cursors.get(&WindowRole::OverlayFullscreen).copied(),
+            Some(CursorKind::Pointer),
+            "Hovering center text of {:?} must set Pointer cursor",
+            btn.id
+        );
+
+        let hovered_corner = backend
+            .pixel_bgra(WindowRole::OverlayFullscreen, btn.rect.x + 3, btn.rect.y + 4)
+            .unwrap();
+        if !matches!(
+            btn.id,
+            PillButtonId::ModeScreenshot | PillButtonId::TargetSelection
+        ) {
+            assert_ne!(
+                hovered_corner, base_corner,
+                "Hovering text center of inactive button {:?} must update button highlight",
+                btn.id
+            );
+        }
+    }
+
+    // Moving off the pill must revert cursor away from Pointer
+    overlay.on_pointer_motion(&mut backend, 100.0, 100.0);
+    assert_eq!(
+        backend.cursors.get(&WindowRole::OverlayFullscreen).copied(),
+        Some(CursorKind::Crosshair)
+    );
+
+    // Settings footer buttons must also hover cleanly over their text centers
+    let mut settings = SettingsController::new(fonts);
+    settings.show(&mut backend, &cfg);
+    let cancel_cx = (540 - 22 - 96 - 10 - 44) as f64;
+    let footer_cy = 531.0;
+    let cancel_before = backend
+        .pixel_bgra(WindowRole::SettingsDialog, cancel_cx as i32 - 35, 520)
+        .unwrap();
+    settings.on_pointer_motion(&mut backend, cancel_cx, footer_cy);
+    assert_eq!(
+        backend.cursors.get(&WindowRole::SettingsDialog).copied(),
+        Some(CursorKind::Pointer)
+    );
+    let cancel_after = backend
+        .pixel_bgra(WindowRole::SettingsDialog, cancel_cx as i32 - 35, 520)
+        .unwrap();
+    assert_ne!(cancel_before, cancel_after);
+}
