@@ -140,6 +140,8 @@ pub trait DisplayBackend {
     ) -> vexrec_core::Result<()>;
 
     fn set_cursor(&mut self, role: WindowRole, cursor: CursorKind);
+    fn minimize_surface(&mut self, _role: WindowRole) {}
+    fn begin_surface_move(&mut self, _role: WindowRole) {}
     fn grab_overlay_keyboard(&mut self) -> bool;
     fn ungrab_overlay_keyboard(&mut self);
 

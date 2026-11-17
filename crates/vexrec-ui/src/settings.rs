@@ -15,6 +15,7 @@ pub const SETTINGS_H: u32 = 560;
 #[derive(Debug, Clone)]
 pub enum SettingsOutcome {
     None,
+    Minimize,
     Close,
     Saved(VexrecConfig),
     BrowseScreenshotDir,
@@ -23,6 +24,8 @@ pub enum SettingsOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsControlId {
+    Minimize,
+    Close,
     CycleFps,
     CycleContainer,
     CycleEncoder,
@@ -47,12 +50,13 @@ struct ControlRect {
     rect: Rect,
 }
 
-/// Pure-Rust dark preferences window (`540x560`) rendered directly onto a display surface.
+/// Pure-Rust borderless preferences window (`540x560`) rendered directly onto a display surface.
 pub struct SettingsController {
     canvas: SurfaceCanvas,
     visible: bool,
     draft: VexrecConfig,
     controls: Vec<ControlRect>,
+    non_drag_rects: Vec<Rect>,
     hovered: Option<SettingsControlId>,
     last_geom: Rect,
 }
@@ -63,7 +67,8 @@ impl SettingsController {
             canvas: SurfaceCanvas::new(SETTINGS_W, SETTINGS_H, fonts),
             visible: false,
             draft: VexrecConfig::default(),
-            controls: Vec::with_capacity(18),
+            controls: Vec::with_capacity(20),
+            non_drag_rects: Vec::with_capacity(4),
             hovered: None,
             last_geom: Rect::new(0, 0, SETTINGS_W, SETTINGS_H),
         }
@@ -161,7 +166,13 @@ impl SettingsController {
         x: f64,
         y: f64,
     ) -> SettingsOutcome {
-        if !self.visible || button != 1 || pressed {
+        if !self.visible || button != 1 {
+            return SettingsOutcome::None;
+        }
+        if pressed {
+            if self.is_draggable_point(x, y) {
+                backend.begin_surface_move(WindowRole::SettingsDialog);
+            }
             return SettingsOutcome::None;
         }
         let Some(ctrl) = self.hit_test(x, y) else {
@@ -195,8 +206,20 @@ impl SettingsController {
             .map(|c| c.id)
     }
 
+    /// Returns true if `(x, y)` lies on a draggable region (anywhere inside the surface
+    /// except interactive buttons, toggles, dropdown pills, and path input fields).
+    pub fn is_draggable_point(&self, x: f64, y: f64) -> bool {
+        let pt = Point::new(x.round() as i32, y.round() as i32);
+        if !Rect::new(0, 0, SETTINGS_W, SETTINGS_H).contains(pt) {
+            return false;
+        }
+        self.hit_test(x, y).is_none() && !self.non_drag_rects.iter().any(|r| r.contains(pt))
+    }
+
     pub fn activate_control(&mut self, id: SettingsControlId) -> SettingsOutcome {
         match id {
+            SettingsControlId::Minimize => SettingsOutcome::Minimize,
+            SettingsControlId::Close => SettingsOutcome::Close,
             SettingsControlId::CycleFps => {
                 self.draft.recording.framerate = match self.draft.recording.framerate {
                     30 => 60,
@@ -292,6 +315,7 @@ impl SettingsController {
 
     pub fn rebuild_layout_and_render(&mut self) {
         self.controls.clear();
+        self.non_drag_rects.clear();
         self.canvas.clear_transparent(None);
 
         let w = SETTINGS_W as f32;
@@ -311,19 +335,84 @@ impl SettingsController {
             None,
         );
 
-        // Header
+        // Borderless Header (draggable except Minimize & Close buttons)
         self.canvas
             .draw_text(FontRole::Sans, 16.0, 22, 31, "Vexrec Preferences", [250, 250, 250, 255]);
-        let badge = "Linux Bare-Metal";
-        let (bw, _) = self.canvas.measure_text(FontRole::Sans, 11.0, badge);
-        self.canvas.draw_text(
-            FontRole::Sans,
-            11.0,
-            SETTINGS_W as i32 - bw - 22,
-            30,
-            badge,
-            [113, 113, 122, 255],
+
+        let close_rect = Rect::new(SETTINGS_W as i32 - 14 - 28, 11, 28, 28);
+        let min_rect = Rect::new(close_rect.x - 6 - 28, 11, 28, 28);
+
+        let min_hover = self.hovered == Some(SettingsControlId::Minimize);
+        if min_hover {
+            self.canvas.fill_rounded_rect(
+                min_rect.x as f32,
+                min_rect.y as f32,
+                min_rect.width as f32,
+                min_rect.height as f32,
+                6.0,
+                [63, 63, 70, 220],
+                None,
+            );
+        }
+        let min_fg = if min_hover {
+            [255, 255, 255, 255]
+        } else {
+            [180, 180, 188, 255]
+        };
+        self.canvas.draw_line(
+            min_rect.x as f32 + 9.0,
+            min_rect.y as f32 + 14.0,
+            min_rect.x as f32 + 19.0,
+            min_rect.y as f32 + 14.0,
+            1.6,
+            min_fg,
+            None,
         );
+        self.controls.push(ControlRect {
+            id: SettingsControlId::Minimize,
+            rect: min_rect,
+        });
+
+        let close_hover = self.hovered == Some(SettingsControlId::Close);
+        if close_hover {
+            self.canvas.fill_rounded_rect(
+                close_rect.x as f32,
+                close_rect.y as f32,
+                close_rect.width as f32,
+                close_rect.height as f32,
+                6.0,
+                [220, 38, 38, 215],
+                None,
+            );
+        }
+        let close_fg = if close_hover {
+            [255, 255, 255, 255]
+        } else {
+            [180, 180, 188, 255]
+        };
+        self.canvas.draw_line(
+            close_rect.x as f32 + 9.5,
+            close_rect.y as f32 + 9.5,
+            close_rect.x as f32 + 18.5,
+            close_rect.y as f32 + 18.5,
+            1.6,
+            close_fg,
+            None,
+        );
+        self.canvas.draw_line(
+            close_rect.x as f32 + 9.5,
+            close_rect.y as f32 + 18.5,
+            close_rect.x as f32 + 18.5,
+            close_rect.y as f32 + 9.5,
+            1.6,
+            close_fg,
+            None,
+        );
+        self.controls.push(ControlRect {
+            id: SettingsControlId::Close,
+            rect: close_rect,
+        });
+
         self.canvas
             .draw_sharp_rect(0, 50, SETTINGS_W, 1, [39, 39, 42, 255], None);
 
@@ -634,6 +723,7 @@ impl SettingsController {
         );
         let browse_rect = Rect::new(SETTINGS_W as i32 - 22 - 74, y + 1, 74, 23);
         let path_rect = Rect::new(160, y + 1, (browse_rect.x - 160 - 8).max(0) as u32, 23);
+        self.non_drag_rects.push(path_rect);
 
         self.canvas.fill_rounded_rect(
             path_rect.x as f32,

@@ -54,7 +54,7 @@ struct X11Atoms {
     net_wm_window_type_desktop: u32,
     net_wm_window_type_dock: u32,
     net_wm_window_type_utility: u32,
-    net_wm_window_type_dialog: u32,
+    net_wm_window_type_normal: u32,
     net_wm_state: u32,
     net_wm_state_hidden: u32,
     net_wm_state_above: u32,
@@ -65,7 +65,9 @@ struct X11Atoms {
     net_wm_name: u32,
     net_wm_icon: u32,
     net_active_window: u32,
+    net_wm_moveresize: u32,
     motif_wm_hints: u32,
+    wm_change_state: u32,
     wm_protocols: u32,
     wm_delete_window: u32,
     clipboard: u32,
@@ -78,14 +80,14 @@ struct X11Atoms {
 
 impl X11Atoms {
     fn intern_all(conn: &RustConnection<DefaultStream>) -> Result<Self> {
-        let names: [&[u8]; 26] = [
+        let names: [&[u8]; 28] = [
             b"_NET_CLIENT_LIST",
             b"_NET_WM_PID",
             b"_NET_WM_WINDOW_TYPE",
             b"_NET_WM_WINDOW_TYPE_DESKTOP",
             b"_NET_WM_WINDOW_TYPE_DOCK",
             b"_NET_WM_WINDOW_TYPE_UTILITY",
-            b"_NET_WM_WINDOW_TYPE_DIALOG",
+            b"_NET_WM_WINDOW_TYPE_NORMAL",
             b"_NET_WM_STATE",
             b"_NET_WM_STATE_HIDDEN",
             b"_NET_WM_STATE_ABOVE",
@@ -96,7 +98,9 @@ impl X11Atoms {
             b"_NET_WM_NAME",
             b"_NET_WM_ICON",
             b"_NET_ACTIVE_WINDOW",
+            b"_NET_WM_MOVERESIZE",
             b"_MOTIF_WM_HINTS",
+            b"WM_CHANGE_STATE",
             b"WM_PROTOCOLS",
             b"WM_DELETE_WINDOW",
             b"CLIPBOARD",
@@ -107,7 +111,7 @@ impl X11Atoms {
             b"image/bmp",
         ];
 
-        // Pipelined atom interning: 1 RTT total for all 26 atoms!
+        // Pipelined atom interning: 1 RTT total for all atoms!
         let mut cookies = Vec::with_capacity(names.len());
         for name in names {
             cookies.push(
@@ -132,7 +136,7 @@ impl X11Atoms {
             net_wm_window_type_desktop: atoms[3],
             net_wm_window_type_dock: atoms[4],
             net_wm_window_type_utility: atoms[5],
-            net_wm_window_type_dialog: atoms[6],
+            net_wm_window_type_normal: atoms[6],
             net_wm_state: atoms[7],
             net_wm_state_hidden: atoms[8],
             net_wm_state_above: atoms[9],
@@ -143,15 +147,17 @@ impl X11Atoms {
             net_wm_name: atoms[14],
             net_wm_icon: atoms[15],
             net_active_window: atoms[16],
-            motif_wm_hints: atoms[17],
-            wm_protocols: atoms[18],
-            wm_delete_window: atoms[19],
-            clipboard: atoms[20],
-            targets: atoms[21],
-            timestamp: atoms[22],
-            incr: atoms[23],
-            image_png: atoms[24],
-            image_bmp: atoms[25],
+            net_wm_moveresize: atoms[17],
+            motif_wm_hints: atoms[18],
+            wm_change_state: atoms[19],
+            wm_protocols: atoms[20],
+            wm_delete_window: atoms[21],
+            clipboard: atoms[22],
+            targets: atoms[23],
+            timestamp: atoms[24],
+            incr: atoms[25],
+            image_png: atoms[26],
+            image_bmp: atoms[27],
         })
     }
 }
@@ -209,6 +215,7 @@ pub struct X11Display {
     grabbed_hotkeys: bool,
     overlay_pointer_grabbed: bool,
     overlay_cursor: CursorKind,
+    last_button_press: Option<(u32, i16, i16)>,
     kbd_mapping: Option<(u8, u8, Vec<u32>)>, // (min_kc, syms_per_kc, keysyms)
 }
 
@@ -363,6 +370,7 @@ impl X11Display {
             grabbed_hotkeys: false,
             overlay_pointer_grabbed: false,
             overlay_cursor: CursorKind::Default,
+            last_button_press: None,
             kbd_mapping,
         };
 
@@ -511,7 +519,10 @@ impl X11Display {
         let win = self.conn.generate_id().map_err(|e| VexrecError::Display(e.to_string()))?;
         let use_argb = matches!(
             role,
-            WindowRole::IndicatorPill | WindowRole::RecordingFrame | WindowRole::OverlayFullscreen
+            WindowRole::IndicatorPill
+                | WindowRole::RecordingFrame
+                | WindowRole::OverlayFullscreen
+                | WindowRole::SettingsDialog
         ) && self.argb32_visual.is_some();
 
         let (depth, visual, cmap_opt) = if use_argb {
@@ -655,12 +666,50 @@ impl X11Display {
                     xproto::AtomEnum::STRING,
                     b"Vexrec Preferences",
                 );
+                let _ = self.conn.change_property8(
+                    xproto::PropMode::REPLACE,
+                    win,
+                    xproto::AtomEnum::WM_CLASS,
+                    xproto::AtomEnum::STRING,
+                    b"vexrec\0vexrec\0",
+                );
+                let _ = self.conn.change_property32(
+                    xproto::PropMode::REPLACE,
+                    win,
+                    self.atoms.net_wm_pid,
+                    xproto::AtomEnum::CARDINAL,
+                    &[std::process::id()],
+                );
                 let _ = self.conn.change_property32(
                     xproto::PropMode::REPLACE,
                     win,
                     self.atoms.net_wm_window_type,
                     xproto::AtomEnum::ATOM,
-                    &[self.atoms.net_wm_window_type_dialog],
+                    &[self.atoms.net_wm_window_type_normal],
+                );
+                // Undecorated (no OS titlebar/frame): flags = 2 (decorations), decorations = 0
+                let _ = self.conn.change_property32(
+                    xproto::PropMode::REPLACE,
+                    win,
+                    self.atoms.motif_wm_hints,
+                    self.atoms.motif_wm_hints,
+                    &[2, 0, 0, 0, 0],
+                );
+                // Lock min == max size in ICCCM WM_NORMAL_HINTS so window is non-resizable
+                let fw = geom.width.max(1);
+                let fh = geom.height.max(1);
+                let mut size_hints = [0u32; 18];
+                size_hints[0] = (1 << 2) | (1 << 4) | (1 << 5); // PPosition | PMinSize | PMaxSize
+                size_hints[5] = fw;
+                size_hints[6] = fh;
+                size_hints[7] = fw;
+                size_hints[8] = fh;
+                let _ = self.conn.change_property32(
+                    xproto::PropMode::REPLACE,
+                    win,
+                    xproto::AtomEnum::WM_NORMAL_HINTS,
+                    xproto::AtomEnum::WM_SIZE_HINTS,
+                    &size_hints,
                 );
                 let _ = self.conn.change_property32(
                     xproto::PropMode::REPLACE,
@@ -1444,6 +1493,68 @@ impl DisplayBackend for X11Display {
         let _ = self.conn.flush();
     }
 
+    fn minimize_surface(&mut self, role: WindowRole) {
+        let Some(win) = self.surfaces.get(&role).map(|s| s.window) else {
+            return;
+        };
+        let ev = xproto::ClientMessageEvent {
+            response_type: xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: win,
+            type_: self.atoms.wm_change_state,
+            data: xproto::ClientMessageData::from([3u32, 0, 0, 0, 0]), // ICCCM IconicState
+        };
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        );
+        let _ = self.conn.flush();
+    }
+
+    fn begin_surface_move(&mut self, role: WindowRole) {
+        let Some(win) = self.surfaces.get(&role).map(|s| s.window) else {
+            return;
+        };
+        let (rx, ry) = self
+            .last_button_press
+            .filter(|&(w, _, _)| w == win)
+            .map(|(_, x, y)| (x, y))
+            .or_else(|| {
+                self.conn
+                    .query_pointer(win)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|rep| (rep.root_x, rep.root_y))
+            })
+            .unwrap_or((0, 0));
+        // Release implicit passive ButtonPress grab so the window manager can grab pointer for move
+        let _ = self.conn.ungrab_pointer(x11rb::CURRENT_TIME);
+        let ev = xproto::ClientMessageEvent {
+            response_type: xproto::CLIENT_MESSAGE_EVENT,
+            format: 32,
+            sequence: 0,
+            window: win,
+            type_: self.atoms.net_wm_moveresize,
+            data: xproto::ClientMessageData::from([
+                rx as i32 as u32,
+                ry as i32 as u32,
+                8, // _NET_WM_MOVERESIZE_MOVE
+                1, // button 1
+                2, // source indication: normal application
+            ]),
+        };
+        let _ = self.conn.send_event(
+            false,
+            self.root,
+            xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+            ev,
+        );
+        let _ = self.conn.flush();
+    }
+
     fn grab_overlay_keyboard(&mut self) -> bool {
         let Some(surf) = self.surfaces.get(&WindowRole::OverlayFullscreen) else {
             return false;
@@ -1609,6 +1720,7 @@ impl DisplayBackend for X11Display {
                     }
                 }
                 Event::ButtonPress(e) => {
+                    self.last_button_press = Some((e.event, e.root_x, e.root_y));
                     if let Some(role) = self.role_by_window(e.event) {
                         events.push(DisplayEvent::PointerButton {
                             role,

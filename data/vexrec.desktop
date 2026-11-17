@@ -9,6 +9,7 @@ Type=Application
 Categories=AudioVideo;Recorder;Utility;
 Keywords=screenshot;screen;record;screencast;capture;vexrec;
 StartupNotify=true
+StartupWMClass=vexrec
 Actions=AreaScreenshot;FullscreenScreenshot;RecordScreen;
 
 [Desktop Action AreaScreenshot]

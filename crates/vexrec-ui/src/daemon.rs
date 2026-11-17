@@ -531,6 +531,9 @@ impl DaemonApp {
     fn handle_settings_outcome(&mut self, outcome: SettingsOutcome) {
         match outcome {
             SettingsOutcome::None => {}
+            SettingsOutcome::Minimize => {
+                self.backend.minimize_surface(WindowRole::SettingsDialog);
+            }
             SettingsOutcome::Close => {
                 self.settings.hide(&mut *self.backend);
             }

@@ -25,6 +25,8 @@ struct MockBackend {
     visible: HashMap<WindowRole, Rect>,
     cursors: HashMap<WindowRole, CursorKind>,
     surfaces: HashMap<WindowRole, Vec<u8>>,
+    minimized: Vec<WindowRole>,
+    drag_starts: Vec<WindowRole>,
 }
 
 impl MockBackend {
@@ -35,6 +37,8 @@ impl MockBackend {
             visible: HashMap::new(),
             cursors: HashMap::new(),
             surfaces: HashMap::new(),
+            minimized: Vec::new(),
+            drag_starts: Vec::new(),
         }
     }
 
@@ -118,6 +122,14 @@ impl DisplayBackend for MockBackend {
 
     fn set_cursor(&mut self, role: WindowRole, cursor: CursorKind) {
         self.cursors.insert(role, cursor);
+    }
+
+    fn minimize_surface(&mut self, role: WindowRole) {
+        self.minimized.push(role);
+    }
+
+    fn begin_surface_move(&mut self, role: WindowRole) {
+        self.drag_starts.push(role);
     }
 
     fn grab_overlay_keyboard(&mut self) -> bool {
@@ -592,4 +604,80 @@ fn test_hover_over_pill_and_settings_button_text_centers() {
         .pixel_bgra(WindowRole::SettingsDialog, cancel_cx as i32 - 35, 520)
         .unwrap();
     assert_ne!(cancel_before, cancel_after);
+}
+
+#[test]
+fn test_settings_borderless_draggable_controls_minimize_close_and_no_badge() {
+    let fonts = Arc::new(FontEngine::load_system_fonts());
+    let mut backend = MockBackend::new(1920, 1080);
+    let cfg = VexrecConfig::default();
+
+    let mut settings = SettingsController::new(fonts);
+    settings.show(&mut backend, &cfg);
+
+    // "Linux Bare-Metal" text removed -> area left of Minimize button is clean background (#18181b -> BGRA [27,24,24,255])
+    for probe_x in 380..450 {
+        let px = backend
+            .pixel_bgra(WindowRole::SettingsDialog, probe_x, 26)
+            .unwrap();
+        assert_eq!(px, [27, 24, 24, 255], "Expected clean header bg at x={probe_x}");
+    }
+
+    // Header title area, row label area, and empty footer area must be draggable
+    for &(dx, dy) in &[(100.0, 25.0), (420.0, 25.0), (60.0, 88.0), (100.0, 531.0)] {
+        assert!(
+            settings.is_draggable_point(dx, dy),
+            "Point ({dx}, {dy}) should be draggable"
+        );
+        let before_cnt = backend.drag_starts.len();
+        settings.on_pointer_button(&mut backend, 1, true, dx, dy);
+        assert_eq!(
+            backend.drag_starts.len(),
+            before_cnt + 1,
+            "Pressing ({dx}, {dy}) must initiate window move"
+        );
+        assert_eq!(backend.drag_starts.last().copied(), Some(WindowRole::SettingsDialog));
+    }
+
+    // Buttons (Minimize, Close, Save, Cancel, cycle pills, toggles, Browse) & path inputs must NOT drag
+    let drag_before_controls = backend.drag_starts.len();
+    for &(nx, ny) in &[
+        (478.0, 25.0),  // Minimize
+        (512.0, 25.0),  // Close
+        (400.0, 88.0),  // Framerate cycle pill
+        (480.0, 195.0), // Hardware Accel toggle
+        (480.0, 450.0), // Browse Screenshots Dir
+        (220.0, 450.0), // Screenshots Dir path input box
+        (470.0, 531.0), // Save button
+        (378.0, 531.0), // Cancel button
+    ] {
+        assert!(
+            !settings.is_draggable_point(nx, ny),
+            "Control/input at ({nx}, {ny}) must NOT be draggable"
+        );
+        settings.on_pointer_button(&mut backend, 1, true, nx, ny);
+    }
+    assert_eq!(
+        backend.drag_starts.len(),
+        drag_before_controls,
+        "Pressing buttons or path inputs must never start window dragging"
+    );
+
+    // Minimize button hover & click
+    settings.on_pointer_motion(&mut backend, 478.0, 25.0);
+    assert_eq!(
+        backend.cursors.get(&WindowRole::SettingsDialog).copied(),
+        Some(CursorKind::Pointer)
+    );
+    let min_out = settings.on_pointer_button(&mut backend, 1, false, 478.0, 25.0);
+    assert!(matches!(min_out, SettingsOutcome::Minimize));
+
+    // Close button hover & click
+    settings.on_pointer_motion(&mut backend, 512.0, 25.0);
+    assert_eq!(
+        backend.cursors.get(&WindowRole::SettingsDialog).copied(),
+        Some(CursorKind::Pointer)
+    );
+    let close_out = settings.on_pointer_button(&mut backend, 1, false, 512.0, 25.0);
+    assert!(matches!(close_out, SettingsOutcome::Close));
 }

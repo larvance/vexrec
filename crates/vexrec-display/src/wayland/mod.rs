@@ -112,6 +112,7 @@ struct WlState {
     pointer: Option<wl_pointer::WlPointer>,
     pointer_shape: Option<WpCursorShapeDeviceV1>,
     last_pointer_enter_serial: u32,
+    last_pointer_press_serial: u32,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     active_seat: Option<wl_seat::WlSeat>,
     ctrl_down: bool,
@@ -247,7 +248,8 @@ impl PointerHandler for WlState {
                         y: ev.position.1,
                     });
                 }
-                PointerEventKind::Press { button, .. } => {
+                PointerEventKind::Press { button, serial, .. } => {
+                    self.last_pointer_press_serial = serial;
                     let b = match button {
                         BTN_LEFT => 1,
                         BTN_MIDDLE => 2,
@@ -559,6 +561,7 @@ impl WaylandDisplay {
             pointer: None,
             pointer_shape: None,
             last_pointer_enter_serial: 0,
+            last_pointer_press_serial: 0,
             keyboard: None,
             active_seat: None,
             ctrl_down: false,
@@ -753,9 +756,14 @@ impl WaylandDisplay {
                 SurfaceShell::Layer(ls)
             }
             (_, _) => {
+                let decorations = if role == WindowRole::SettingsDialog {
+                    WindowDecorations::None
+                } else {
+                    WindowDecorations::RequestServer
+                };
                 let win = self.state.xdg_shell.create_window(
                     wl_surface.clone(),
-                    WindowDecorations::RequestServer,
+                    decorations,
                     &self.qh,
                 );
                 match role {
@@ -772,7 +780,12 @@ impl WaylandDisplay {
                         }
                     }
                     WindowRole::SettingsDialog => {
+                        let fw = geom.width.max(1);
+                        let fh = geom.height.max(1);
                         win.set_title("Vexrec Preferences");
+                        win.set_app_id("vexrec");
+                        win.set_min_size(Some((fw, fh)));
+                        win.set_max_size(Some((fw, fh)));
                     }
                 }
                 win.commit();
@@ -965,7 +978,10 @@ impl DisplayBackend for WaylandDisplay {
 
         let pool = self.state.pool.as_mut().unwrap();
         let dst_stride = width * 4;
-        let fmt = if matches!(role, WindowRole::IndicatorPill | WindowRole::RecordingFrame) {
+        let fmt = if matches!(
+            role,
+            WindowRole::IndicatorPill | WindowRole::RecordingFrame | WindowRole::SettingsDialog
+        ) {
             wl_shm::Format::Argb8888
         } else {
             wl_shm::Format::Xrgb8888
@@ -1005,6 +1021,24 @@ impl DisplayBackend for WaylandDisplay {
             };
             shape_dev.set_shape(self.state.last_pointer_enter_serial, s);
             let _ = self.conn.flush();
+        }
+    }
+
+    fn minimize_surface(&mut self, role: WindowRole) {
+        if let Some(ms) = self.state.surfaces.get(&role) {
+            if let SurfaceShell::Xdg(ref win) = ms.shell {
+                win.set_minimized();
+                let _ = self.conn.flush();
+            }
+        }
+    }
+
+    fn begin_surface_move(&mut self, role: WindowRole) {
+        if let (Some(ms), Some(ref seat)) = (self.state.surfaces.get(&role), &self.state.active_seat) {
+            if let SurfaceShell::Xdg(ref win) = ms.shell {
+                win.move_(seat, self.state.last_pointer_press_serial);
+                let _ = self.conn.flush();
+            }
         }
     }
 

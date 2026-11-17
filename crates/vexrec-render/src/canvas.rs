@@ -453,6 +453,67 @@ impl SurfaceCanvas {
         );
     }
 
+    /// Analytical SDF anti-aliased line segment with round caps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        thickness: f32,
+        color_rgba: [u8; 4],
+        clip: Option<Rect>,
+    ) {
+        if thickness <= 0.0 || color_rgba[3] == 0 {
+            return;
+        }
+        let half_t = thickness * 0.5;
+        let pad = half_t.ceil() as i32 + 2;
+        let cr = self.effective_clip(clip);
+        let min_x = (x0.min(x1).floor() as i32 - pad).max(cr.x);
+        let min_y = (y0.min(y1).floor() as i32 - pad).max(cr.y);
+        let max_x = (x0.max(x1).ceil() as i32 + pad).min(cr.x + cr.width as i32);
+        let max_y = (y0.max(y1).ceil() as i32 + pad).min(cr.y + cr.height as i32);
+        if max_x <= min_x || max_y <= min_y {
+            return;
+        }
+
+        let vx = x1 - x0;
+        let vy = y1 - y0;
+        let len_sq = vx * vx + vy * vy;
+        let [r, g, b, a] = color_rgba;
+        let stride = self.stride as usize;
+        let dst = self.data.as_mut_slice();
+
+        for py in min_y..max_y {
+            let p_y = py as f32 + 0.5 - y0;
+            let row_off = (py as usize) * stride;
+            for px in min_x..max_x {
+                let p_x = px as f32 + 0.5 - x0;
+                let h = if len_sq > 1e-6 {
+                    ((p_x * vx + p_y * vy) / len_sq).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dx = p_x - vx * h;
+                let dy = p_y - vy * h;
+                let dist = (dx * dx + dy * dy).sqrt() - half_t;
+                let cov = sdf_fill_cov(dist);
+                if cov == 0 {
+                    continue;
+                }
+                let eff_a = if cov == 255 {
+                    a
+                } else {
+                    ((cov as u32 * a as u32 + 128) * 257 >> 16) as u8
+                };
+                let off = row_off + (px as usize) * 4;
+                blend_pixel_bgra(&mut dst[off..off + 4], b, g, r, eff_a);
+            }
+        }
+    }
+
     /// Blits and scales a window/desktop `PixelImage` directly into `(dx, dy, dw, dh)` clipped by
     /// rounded corners and optional `alpha`, without allocating temporary scaled bitmaps.
     pub fn blit_scaled_rounded_image(
