@@ -1,130 +1,135 @@
-use gtk::prelude::*;
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::Instant;
+use std::sync::Arc;
+use vexrec_core::geometry::Rect;
+use vexrec_display::{CursorKind, DisplayBackend, WindowRole};
+use vexrec_os::fonts::{FontEngine, FontRole};
+use vexrec_render::SurfaceCanvas;
 
-pub struct RecordingIndicatorWindow {
-    window: gtk::Window,
-    time_label: gtk::Label,
-    timer_source: Rc<RefCell<Option<glib::SourceId>>>,
-    start_time: Rc<RefCell<Option<Instant>>>,
+pub const INDICATOR_W: u32 = 100;
+pub const INDICATOR_H: u32 = 28;
+
+/// Minimalist top-right floating recording timer pill (`100x28`) with click-to-stop interaction.
+pub struct IndicatorController {
+    canvas: SurfaceCanvas,
+    visible: bool,
+    last_secs: u64,
+    last_paused: bool,
+    last_geom: Rect,
 }
 
-impl RecordingIndicatorWindow {
-    pub fn new<F>(on_stop: F) -> Self
-    where
-        F: Fn() + 'static,
-    {
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_title("Vexrec Indicator");
-        window.set_decorated(false);
-        window.set_skip_taskbar_hint(true);
-        window.set_skip_pager_hint(true);
-        window.set_keep_above(true);
-        window.set_app_paintable(true);
-        window.set_default_size(100, 28);
-        window.set_resizable(false);
-
-        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
-            if let Some(visual) = screen.rgba_visual() {
-                window.set_visual(Some(&visual));
-            }
-        }
-
-        // Draw transparent background for window
-        window.connect_draw(|_win, cr| {
-            cr.set_operator(cairo::Operator::Source);
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-            let _ = cr.paint();
-            glib::Propagation::Proceed
-        });
-
-        let button = gtk::Button::new();
-        button.set_tooltip_text(Some("Stop Recording (Click)"));
-        button.style_context().add_class("indicator-pill");
-
-        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        hbox.set_halign(gtk::Align::Center);
-        hbox.set_valign(gtk::Align::Center);
-
-        // Red pulsing dot
-        let dot = gtk::DrawingArea::new();
-        dot.set_size_request(10, 10);
-        dot.connect_draw(|_widget, cr| {
-            cr.set_operator(cairo::Operator::Over);
-            // Red circle
-            cr.set_source_rgb(0.937, 0.267, 0.267);
-            cr.arc(5.0, 5.0, 4.5, 0.0, 2.0 * std::f64::consts::PI);
-            let _ = cr.fill();
-            glib::Propagation::Proceed
-        });
-
-        let time_label = gtk::Label::new(Some("00:00"));
-        time_label.style_context().add_class("indicator-time");
-
-        hbox.pack_start(&dot, false, false, 0);
-        hbox.pack_start(&time_label, false, false, 0);
-        button.add(&hbox);
-        window.add(&button);
-
-        button.connect_clicked(move |_| {
-            on_stop();
-        });
-
-        let timer_source = Rc::new(RefCell::new(None));
-        let start_time = Rc::new(RefCell::new(None));
-
+impl IndicatorController {
+    pub fn new(fonts: Arc<FontEngine>) -> Self {
         Self {
-            window,
-            time_label,
-            timer_source,
-            start_time,
+            canvas: SurfaceCanvas::new(INDICATOR_W, INDICATOR_H, fonts),
+            visible: false,
+            last_secs: u64::MAX,
+            last_paused: false,
+            last_geom: Rect::new(0, 0, INDICATOR_W, INDICATOR_H),
         }
     }
 
-    pub fn show_indicator(&self) {
-        let screen_w = gdk::Display::default()
-            .and_then(|d| d.primary_monitor().or_else(|| d.monitor(0)))
-            .map(|m| m.geometry().width())
-            .unwrap_or(1920);
-        let x = (screen_w - 120).max(0);
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn show(&mut self, backend: &mut dyn DisplayBackend) {
+        let screen = backend.primary_size();
+        let x = (screen.width as i32 - INDICATOR_W as i32 - 20).max(16);
         let y = 38;
+        self.last_geom = Rect::new(x, y, INDICATOR_W, INDICATOR_H);
+        self.last_secs = u64::MAX;
+        self.last_paused = false;
+        self.visible = true;
 
-        self.window.move_(x, y);
-        self.window.show_all();
-        self.window.set_keep_above(true);
-
-        *self.start_time.borrow_mut() = Some(Instant::now());
-        self.time_label.set_text("00:00");
-
-        // Cancel previous timer if any
-        if let Some(source) = self.timer_source.borrow_mut().take() {
-            source.remove();
-        }
-
-        let label_clone = self.time_label.clone();
-        let start_clone = self.start_time.clone();
-
-        let source = glib::timeout_add_seconds_local(1, move || {
-            if let Some(start) = *start_clone.borrow() {
-                let secs = start.elapsed().as_secs();
-                let mins = secs / 60;
-                let rem_secs = secs % 60;
-                label_clone.set_text(&format!("{:02}:{:02}", mins, rem_secs));
-                glib::ControlFlow::Continue
-            } else {
-                glib::ControlFlow::Break
-            }
-        });
-
-        *self.timer_source.borrow_mut() = Some(source);
+        self.render(0, false);
+        backend.show_surface(WindowRole::IndicatorPill, self.last_geom);
+        backend.set_cursor(WindowRole::IndicatorPill, CursorKind::Pointer);
+        let _ = backend.present_surface_bgra(
+            WindowRole::IndicatorPill,
+            INDICATOR_W,
+            INDICATOR_H,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
     }
 
-    pub fn hide_indicator(&self) {
-        if let Some(source) = self.timer_source.borrow_mut().take() {
-            source.remove();
+    pub fn update(&mut self, backend: &mut dyn DisplayBackend, secs: u64, paused: bool) {
+        if !self.visible {
+            return;
         }
-        *self.start_time.borrow_mut() = None;
-        self.window.hide();
+        if secs == self.last_secs && paused == self.last_paused {
+            return;
+        }
+        self.render(secs, paused);
+        let _ = backend.present_surface_bgra(
+            WindowRole::IndicatorPill,
+            INDICATOR_W,
+            INDICATOR_H,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
+    }
+
+    pub fn on_expose(&self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        let _ = backend.present_surface_bgra(
+            WindowRole::IndicatorPill,
+            INDICATOR_W,
+            INDICATOR_H,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
+    }
+
+    pub fn hide(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        backend.hide_surface(WindowRole::IndicatorPill);
+    }
+
+    fn render(&mut self, secs: u64, paused: bool) {
+        self.last_secs = secs;
+        self.last_paused = paused;
+        self.canvas.clear_transparent(None);
+
+        let w = INDICATOR_W as f32;
+        let h = INDICATOR_H as f32;
+        self.canvas
+            .fill_rounded_rect(0.0, 0.0, w, h, 14.0, [24, 24, 27, 242], None);
+        self.canvas.stroke_rounded_rect(
+            0.5,
+            0.5,
+            w - 1.0,
+            h - 1.0,
+            13.5,
+            1.0,
+            [255, 255, 255, 36],
+            None,
+        );
+
+        let dot_rgba = if paused {
+            [234, 179, 8, 255]
+        } else {
+            [239, 68, 68, 255]
+        };
+        self.canvas.fill_circle(18.0, 14.0, 4.5, dot_rgba, None);
+
+        let mins = secs / 60;
+        let rem = secs % 60;
+        let text = format!("{mins:02}:{rem:02}");
+        self.canvas.draw_text(
+            FontRole::Mono,
+            12.5,
+            34,
+            18,
+            &text,
+            [244, 244, 245, 255],
+        );
     }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.3.0}"
 ARCH="amd64"
 PKG_DIR="target/debian/vexrec_${VERSION}_${ARCH}"
 
@@ -24,17 +24,19 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Aerovex HQ <dev@aerovex.net>
-Depends: libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, gstreamer1.0-pipewire, gstreamer1.0-plugins-good, pipewire, xdg-desktop-portal
+Depends: libc6 (>= 2.31)
+Recommends: pipewire, xdg-desktop-portal, libva2, libvulkan1
 Homepage: https://github.com/aerovexhq/vexrec
-Description: Modern, minimalistic screenshot and screen recorder for Linux
- Vexrec is a lightweight, high-performance screen recording and screenshot application
- written in Rust with PipeWire audio, V4L2 camera overlay, and a modern, minimalistic
- floating GUI built with Tauri, React, and TypeScript.
+Description: Pure-Rust bare-metal screenshot and screen recorder for Linux
+ Vexrec is an ultra-low-latency Linux screenshot and screen recording suite
+ written purely in Rust targeting X11 and Wayland (Hyprland, Sway, KDE, GNOME)
+ with zero GTK, GStreamer, WebKit, or tokio runtime dependencies.
 EOF
 
-# Copy binaries and assets
+# Copy binary and strip debug symbols
 cp target/release/vexrec "${PKG_DIR}/usr/bin/vexrec"
 chmod 755 "${PKG_DIR}/usr/bin/vexrec"
+strip "${PKG_DIR}/usr/bin/vexrec" 2>/dev/null || true
 ln -sf vexrec "${PKG_DIR}/usr/bin/luxrec"
 
 cp data/vexrec.desktop "${PKG_DIR}/usr/share/applications/vexrec.desktop"

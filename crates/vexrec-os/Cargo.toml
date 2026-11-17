@@ -1,0 +1,23 @@
+[package]
+name = "vexrec-os"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vexrec-core = { path = "../vexrec-core" }
+rustix.workspace = true
+libc.workspace = true
+libloading.workspace = true
+memmap2.workspace = true
+fontdue.workspace = true
+zbus.workspace = true
+async-io.workspace = true
+futures-lite.workspace = true
+polling.workspace = true
+png.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true

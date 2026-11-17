@@ -1,22 +1,23 @@
 [workspace]
 members = [
     "crates/vexrec-core",
-    "crates/vexrec-portal",
-    "crates/vexrec-pipeline",
+    "crates/vexrec-os",
+    "crates/vexrec-display",
+    "crates/vexrec-render",
+    "crates/vexrec-media",
     "crates/vexrec-ui",
     "crates/vexrec-cli",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["Aerovex Engineering <engineering@aerovex.net>"]
+authors = ["Larvance <dev@larvance.com>"]
 license = "MIT"
-repository = "https://github.com/aerovexhq/vexrec"
+repository = "https://github.com/larvance/vexrec"
 
 [workspace.dependencies]
-tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
@@ -24,36 +25,51 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
 anyhow = "1.0"
-ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.8", features = ["v4", "serde"] }
-arboard = "3.6"
-imageproc = "0.27"
-x11rb = { version = "0.14", features = ["shm"] }
-tauri = { version = "2.0", default-features = false, features = ["wry", "tray-icon", "image-png", "custom-protocol"] }
-tauri-build = { version = "2.0", default-features = false }
+libc = "0.2"
+rustix = { version = "1.1", features = ["event", "fs", "mm", "net", "pipe", "process", "shm", "thread", "time"] }
+libloading = "0.9"
+memmap2 = "0.9"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+async-io = "2.6"
+futures-lite = "2.6"
+polling = "3.11"
+calloop = "0.14"
+x11rb = { version = "0.14", features = ["shm", "composite", "damage", "dri3", "xfixes", "randr", "shape", "cursor", "xkb", "present"] }
+wayland-client = "0.31"
+wayland-cursor = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+ash = { version = "0.38", default-features = false, features = ["loaded"] }
+fontdue = "0.9"
+rtrb = "0.4"
+nnnoiseless = "0.5"
+opus-pure = "0.2"
+png = "0.18"
+jpeg-encoder = "0.7"
+image-webp = "0.2"
+gif = "0.14"
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+openh264 = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 
 [profile.dev]
-opt-level = 0
-debug = 0
-strip = "symbols"
-incremental = false
-codegen-units = 1
-
-[profile.test]
 opt-level = 1
 debug = 0
-strip = "symbols"
-incremental = false
-codegen-units = 1
+incremental = true
+
+[profile.test]
+opt-level = 2
+debug = 0
 
 [profile.release]
 opt-level = 3
 debug = 0
 strip = "symbols"
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 incremental = false

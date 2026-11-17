@@ -1,200 +1,714 @@
-use gtk::prelude::*;
-use vexrec_core::formats::ContainerFormat;
-use crate::app_state::AppState;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use vexrec_core::config::VexrecConfig;
+use vexrec_core::formats::{
+    ContainerFormat, EncoderBackendPreference, ImageFormat, VideoQuality,
+};
+use vexrec_core::geometry::{Point, Rect};
+use vexrec_display::{CursorKind, DisplayBackend, KeyAction, WindowRole};
+use vexrec_os::fonts::{FontEngine, FontRole};
+use vexrec_render::SurfaceCanvas;
 
-pub struct SettingsWindow {
-    window: gtk::Window,
+pub const SETTINGS_W: u32 = 540;
+pub const SETTINGS_H: u32 = 560;
+
+#[derive(Debug, Clone)]
+pub enum SettingsOutcome {
+    None,
+    Close,
+    Saved(VexrecConfig),
+    BrowseScreenshotDir,
+    BrowseRecordingDir,
 }
 
-impl SettingsWindow {
-    pub fn new(app_state: AppState) -> Self {
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_title("Vexrec Preferences");
-        window.set_default_size(560, 420);
-        window.set_position(gtk::WindowPosition::Center);
-        window.set_resizable(false);
-        window.style_context().add_class("settings-window");
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsControlId {
+    CycleFps,
+    CycleContainer,
+    CycleEncoder,
+    CycleQuality,
+    ToggleHardwareAccel,
+    ToggleShowCursor,
+    ToggleRecordingFrame,
+    ToggleDesktopAudio,
+    ToggleMicAudio,
+    ToggleNoiseSuppression,
+    CycleScreenshotFormat,
+    ToggleCopyClipboard,
+    BrowseScreenshotDir,
+    BrowseRecordingDir,
+    Cancel,
+    Save,
+}
 
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 16);
-        vbox.set_margin_start(24);
-        vbox.set_margin_end(24);
-        vbox.set_margin_top(24);
-        vbox.set_margin_bottom(24);
+#[derive(Debug, Clone)]
+struct ControlRect {
+    id: SettingsControlId,
+    rect: Rect,
+}
+
+/// Pure-Rust dark preferences window (`540x560`) rendered directly onto a display surface.
+pub struct SettingsController {
+    canvas: SurfaceCanvas,
+    visible: bool,
+    draft: VexrecConfig,
+    controls: Vec<ControlRect>,
+    hovered: Option<SettingsControlId>,
+    last_geom: Rect,
+}
+
+impl SettingsController {
+    pub fn new(fonts: Arc<FontEngine>) -> Self {
+        Self {
+            canvas: SurfaceCanvas::new(SETTINGS_W, SETTINGS_H, fonts),
+            visible: false,
+            draft: VexrecConfig::default(),
+            controls: Vec::with_capacity(18),
+            hovered: None,
+            last_geom: Rect::new(0, 0, SETTINGS_W, SETTINGS_H),
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn draft_config(&self) -> &VexrecConfig {
+        &self.draft
+    }
+
+    pub fn show(&mut self, backend: &mut dyn DisplayBackend, cfg: &VexrecConfig) {
+        self.draft = cfg.clone();
+        self.hovered = None;
+        let screen = backend.primary_size();
+        let x = ((screen.width as i32 - SETTINGS_W as i32) / 2).max(0);
+        let y = ((screen.height as i32 - SETTINGS_H as i32) / 2).max(0);
+        self.last_geom = Rect::new(x, y, SETTINGS_W, SETTINGS_H);
+        self.visible = true;
+
+        self.rebuild_layout_and_render();
+        backend.show_surface(WindowRole::SettingsDialog, self.last_geom);
+        backend.set_cursor(WindowRole::SettingsDialog, CursorKind::Default);
+        self.present(backend);
+    }
+
+    pub fn hide(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        self.hovered = None;
+        backend.hide_surface(WindowRole::SettingsDialog);
+    }
+
+    pub fn set_screenshot_dir(&mut self, backend: &mut dyn DisplayBackend, dir: PathBuf) {
+        self.draft.storage.screenshot_dir = dir;
+        if self.visible {
+            self.rebuild_layout_and_render();
+            self.present(backend);
+        }
+    }
+
+    pub fn set_recording_dir(&mut self, backend: &mut dyn DisplayBackend, dir: PathBuf) {
+        self.draft.storage.recording_dir = dir;
+        if self.visible {
+            self.rebuild_layout_and_render();
+            self.present(backend);
+        }
+    }
+
+    pub fn on_expose(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        self.present(backend);
+    }
+
+    pub fn on_pointer_motion(&mut self, backend: &mut dyn DisplayBackend, x: f64, y: f64) {
+        if !self.visible {
+            return;
+        }
+        let next = self.hit_test(x, y);
+        if next != self.hovered {
+            self.hovered = next;
+            let cursor = if next.is_some() {
+                CursorKind::Pointer
+            } else {
+                CursorKind::Default
+            };
+            backend.set_cursor(WindowRole::SettingsDialog, cursor);
+            self.rebuild_layout_and_render();
+            self.present(backend);
+        }
+    }
+
+    pub fn on_pointer_leave(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        if self.hovered.take().is_some() {
+            backend.set_cursor(WindowRole::SettingsDialog, CursorKind::Default);
+            self.rebuild_layout_and_render();
+            self.present(backend);
+        }
+    }
+
+    pub fn on_pointer_button(
+        &mut self,
+        backend: &mut dyn DisplayBackend,
+        button: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    ) -> SettingsOutcome {
+        if !self.visible || button != 1 || pressed {
+            return SettingsOutcome::None;
+        }
+        let Some(ctrl) = self.hit_test(x, y) else {
+            return SettingsOutcome::None;
+        };
+        let outcome = self.activate_control(ctrl);
+        if self.visible {
+            self.rebuild_layout_and_render();
+            self.present(backend);
+        }
+        outcome
+    }
+
+    pub fn on_key(&mut self, _backend: &mut dyn DisplayBackend, key: KeyAction) -> SettingsOutcome {
+        if !self.visible {
+            return SettingsOutcome::None;
+        }
+        match key {
+            KeyAction::Escape => SettingsOutcome::Close,
+            KeyAction::Return => SettingsOutcome::Saved(self.draft.clone()),
+            _ => SettingsOutcome::None,
+        }
+    }
+
+    pub fn hit_test(&self, x: f64, y: f64) -> Option<SettingsControlId> {
+        let px = x.round() as i32;
+        let py = y.round() as i32;
+        self.controls
+            .iter()
+            .find(|c| c.rect.contains(Point::new(px, py)))
+            .map(|c| c.id)
+    }
+
+    pub fn activate_control(&mut self, id: SettingsControlId) -> SettingsOutcome {
+        match id {
+            SettingsControlId::CycleFps => {
+                self.draft.recording.framerate = match self.draft.recording.framerate {
+                    30 => 60,
+                    60 => 120,
+                    _ => 30,
+                };
+                SettingsOutcome::None
+            }
+            SettingsControlId::CycleContainer => {
+                self.draft.recording.container = match self.draft.recording.container {
+                    ContainerFormat::Mp4 => ContainerFormat::Mkv,
+                    ContainerFormat::Mkv => ContainerFormat::Webm,
+                    ContainerFormat::Webm => ContainerFormat::Gif,
+                    ContainerFormat::Gif => ContainerFormat::Mp4,
+                };
+                SettingsOutcome::None
+            }
+            SettingsControlId::CycleEncoder => {
+                self.draft.recording.encoder_preference =
+                    match self.draft.recording.encoder_preference {
+                        EncoderBackendPreference::Auto => EncoderBackendPreference::VaApi,
+                        EncoderBackendPreference::VaApi => EncoderBackendPreference::VulkanVideo,
+                        EncoderBackendPreference::VulkanVideo => EncoderBackendPreference::Nvenc,
+                        EncoderBackendPreference::Nvenc => EncoderBackendPreference::Cpu,
+                        EncoderBackendPreference::Cpu => EncoderBackendPreference::Auto,
+                    };
+                SettingsOutcome::None
+            }
+            SettingsControlId::CycleQuality => {
+                self.draft.recording.quality = match self.draft.recording.quality {
+                    VideoQuality::Low => VideoQuality::Medium,
+                    VideoQuality::Medium => VideoQuality::High,
+                    VideoQuality::High => VideoQuality::Lossless,
+                    VideoQuality::Lossless => VideoQuality::Low,
+                };
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleHardwareAccel => {
+                self.draft.recording.hardware_accel = !self.draft.recording.hardware_accel;
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleShowCursor => {
+                self.draft.recording.show_cursor = !self.draft.recording.show_cursor;
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleRecordingFrame => {
+                self.draft.recording.show_recording_frame =
+                    !self.draft.recording.show_recording_frame;
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleDesktopAudio => {
+                self.draft.audio.capture_desktop = !self.draft.audio.capture_desktop;
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleMicAudio => {
+                self.draft.audio.capture_microphone = !self.draft.audio.capture_microphone;
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleNoiseSuppression => {
+                self.draft.audio.noise_suppression = !self.draft.audio.noise_suppression;
+                SettingsOutcome::None
+            }
+            SettingsControlId::CycleScreenshotFormat => {
+                self.draft.screenshot.default_format = match self.draft.screenshot.default_format {
+                    ImageFormat::Png => ImageFormat::Jpeg,
+                    ImageFormat::Jpeg => ImageFormat::Webp,
+                    ImageFormat::Webp => ImageFormat::Png,
+                };
+                SettingsOutcome::None
+            }
+            SettingsControlId::ToggleCopyClipboard => {
+                self.draft.screenshot.copy_to_clipboard =
+                    !self.draft.screenshot.copy_to_clipboard;
+                SettingsOutcome::None
+            }
+            SettingsControlId::BrowseScreenshotDir => SettingsOutcome::BrowseScreenshotDir,
+            SettingsControlId::BrowseRecordingDir => SettingsOutcome::BrowseRecordingDir,
+            SettingsControlId::Cancel => SettingsOutcome::Close,
+            SettingsControlId::Save => SettingsOutcome::Saved(self.draft.clone()),
+        }
+    }
+
+    fn present(&self, backend: &mut dyn DisplayBackend) {
+        let _ = backend.present_surface_bgra(
+            WindowRole::SettingsDialog,
+            SETTINGS_W,
+            SETTINGS_H,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
+    }
+
+    pub fn rebuild_layout_and_render(&mut self) {
+        self.controls.clear();
+        self.canvas.clear_transparent(None);
+
+        let w = SETTINGS_W as f32;
+        let h = SETTINGS_H as f32;
+
+        // Solid dark surface + crisp zinc border
+        self.canvas
+            .fill_rounded_rect(0.0, 0.0, w, h, 10.0, [24, 24, 27, 255], None);
+        self.canvas.stroke_rounded_rect(
+            0.5,
+            0.5,
+            w - 1.0,
+            h - 1.0,
+            9.5,
+            1.0,
+            [63, 63, 70, 220],
+            None,
+        );
 
         // Header
-        let title_label = gtk::Label::new(None);
-        title_label.set_markup("<span font='16' weight='bold'>Vexrec Preferences</span>");
-        title_label.set_halign(gtk::Align::Start);
-        vbox.pack_start(&title_label, false, false, 0);
+        self.canvas
+            .draw_text(FontRole::Sans, 16.0, 22, 31, "Vexrec Preferences", [250, 250, 250, 255]);
+        let badge = "Linux Bare-Metal";
+        let (bw, _) = self.canvas.measure_text(FontRole::Sans, 11.0, badge);
+        self.canvas.draw_text(
+            FontRole::Sans,
+            11.0,
+            SETTINGS_W as i32 - bw - 22,
+            30,
+            badge,
+            [113, 113, 122, 255],
+        );
+        self.canvas
+            .draw_sharp_rect(0, 50, SETTINGS_W, 1, [39, 39, 42, 255], None);
 
-        let grid = gtk::Grid::new();
-        grid.set_row_spacing(14);
-        grid.set_column_spacing(16);
+        // Section: RECORDING
+        self.draw_section_header(22, 68, "RECORDING");
 
-        let cfg = app_state.get_config();
+        let mut y = 76;
+        let step = 27;
 
-        // Row 0: Screenshot Directory
-        let lbl_snap = gtk::Label::new(Some("Screenshots Directory:"));
-        lbl_snap.set_halign(gtk::Align::Start);
-        let entry_snap = gtk::Entry::new();
-        entry_snap.set_text(&cfg.storage.screenshot_dir.to_string_lossy());
-        entry_snap.set_hexpand(true);
-        let btn_snap = gtk::Button::with_label("Browse...");
+        let fps_label = format!("{} FPS", self.draft.recording.framerate);
+        self.draw_cycle_row(
+            y,
+            "Framerate",
+            &fps_label,
+            SettingsControlId::CycleFps,
+        );
+        y += step;
 
-        let win_clone = window.clone();
-        let entry_snap_clone = entry_snap.clone();
-        btn_snap.connect_clicked(move |_| {
-            let chooser = gtk::FileChooserNative::new(
-                Some("Select Screenshots Folder"),
-                Some(&win_clone),
-                gtk::FileChooserAction::SelectFolder,
-                Some("Select"),
-                Some("Cancel"),
-            );
-            if chooser.run() == gtk::ResponseType::Accept {
-                if let Some(folder) = chooser.filename() {
-                    entry_snap_clone.set_text(&folder.to_string_lossy());
-                }
-            }
-        });
-
-        grid.attach(&lbl_snap, 0, 0, 1, 1);
-        grid.attach(&entry_snap, 1, 0, 1, 1);
-        grid.attach(&btn_snap, 2, 0, 1, 1);
-
-        // Row 1: Recording Directory
-        let lbl_rec = gtk::Label::new(Some("Recordings Directory:"));
-        lbl_rec.set_halign(gtk::Align::Start);
-        let entry_rec = gtk::Entry::new();
-        entry_rec.set_text(&cfg.storage.recording_dir.to_string_lossy());
-        entry_rec.set_hexpand(true);
-        let btn_rec = gtk::Button::with_label("Browse...");
-
-        let win_clone2 = window.clone();
-        let entry_rec_clone = entry_rec.clone();
-        btn_rec.connect_clicked(move |_| {
-            let chooser = gtk::FileChooserNative::new(
-                Some("Select Recordings Folder"),
-                Some(&win_clone2),
-                gtk::FileChooserAction::SelectFolder,
-                Some("Select"),
-                Some("Cancel"),
-            );
-            if chooser.run() == gtk::ResponseType::Accept {
-                if let Some(folder) = chooser.filename() {
-                    entry_rec_clone.set_text(&folder.to_string_lossy());
-                }
-            }
-        });
-
-        grid.attach(&lbl_rec, 0, 1, 1, 1);
-        grid.attach(&entry_rec, 1, 1, 1, 1);
-        grid.attach(&btn_rec, 2, 1, 1, 1);
-
-        // Row 2: Video Framerate
-        let lbl_fps = gtk::Label::new(Some("Target Framerate:"));
-        lbl_fps.set_halign(gtk::Align::Start);
-        let combo_fps = gtk::ComboBoxText::new();
-        combo_fps.append(Some("30"), "30 FPS");
-        combo_fps.append(Some("60"), "60 FPS");
-        combo_fps.append(Some("120"), "120 FPS");
-        combo_fps.set_active_id(Some(&cfg.recording.framerate.to_string()));
-        grid.attach(&lbl_fps, 0, 2, 1, 1);
-        grid.attach(&combo_fps, 1, 2, 2, 1);
-
-        // Row 3: Video Format
-        let lbl_fmt = gtk::Label::new(Some("Video Format:"));
-        lbl_fmt.set_halign(gtk::Align::Start);
-        let combo_fmt = gtk::ComboBoxText::new();
-        combo_fmt.append(Some("mp4"), "MP4 (H.264 / AAC)");
-        combo_fmt.append(Some("mkv"), "MKV (Matroska)");
-        combo_fmt.append(Some("webm"), "WebM (VP9 / Opus)");
-        let fmt_id = match cfg.recording.container {
-            ContainerFormat::Mkv => "mkv",
-            ContainerFormat::Webm => "webm",
-            _ => "mp4",
+        let fmt_label = match self.draft.recording.container {
+            ContainerFormat::Mp4 => "MP4 (fMP4 / Opus)",
+            ContainerFormat::Mkv => "MKV (Matroska / Opus)",
+            ContainerFormat::Webm => "WebM (VP9 / Opus)",
+            ContainerFormat::Gif => "GIF (Animated)",
         };
-        combo_fmt.set_active_id(Some(fmt_id));
-        grid.attach(&lbl_fmt, 0, 3, 1, 1);
-        grid.attach(&combo_fmt, 1, 3, 2, 1);
+        self.draw_cycle_row(
+            y,
+            "Container Format",
+            fmt_label,
+            SettingsControlId::CycleContainer,
+        );
+        y += step;
 
-        // Row 4: Show Cursor
-        let lbl_cursor = gtk::Label::new(Some("Capture Mouse Cursor:"));
-        lbl_cursor.set_halign(gtk::Align::Start);
-        let switch_cursor = gtk::Switch::new();
-        switch_cursor.set_active(cfg.recording.show_cursor);
-        switch_cursor.set_halign(gtk::Align::Start);
-        grid.attach(&lbl_cursor, 0, 4, 1, 1);
-        grid.attach(&switch_cursor, 1, 4, 2, 1);
+        let enc_label = match self.draft.recording.encoder_preference {
+            EncoderBackendPreference::Auto => "Auto (HW -> CPU)",
+            EncoderBackendPreference::VaApi => "VA-API (DRM)",
+            EncoderBackendPreference::VulkanVideo => "Vulkan Video",
+            EncoderBackendPreference::Nvenc => "NVIDIA NVENC",
+            EncoderBackendPreference::Cpu => "CPU (Software)",
+        };
+        self.draw_cycle_row(
+            y,
+            "Encoder Backend",
+            enc_label,
+            SettingsControlId::CycleEncoder,
+        );
+        y += step;
 
-        // Row 5: Show Recording Frame
-        let lbl_frame = gtk::Label::new(Some("Show Recording Frame:"));
-        lbl_frame.set_halign(gtk::Align::Start);
-        let switch_frame = gtk::Switch::new();
-        switch_frame.set_active(cfg.recording.show_recording_frame);
-        switch_frame.set_halign(gtk::Align::Start);
-        grid.attach(&lbl_frame, 0, 5, 1, 1);
-        grid.attach(&switch_frame, 1, 5, 2, 1);
+        let qual_label = match self.draft.recording.quality {
+            VideoQuality::Low => "Low",
+            VideoQuality::Medium => "Medium",
+            VideoQuality::High => "High",
+            VideoQuality::Lossless => "Lossless",
+        };
+        self.draw_cycle_row(
+            y,
+            "Quality Preset",
+            qual_label,
+            SettingsControlId::CycleQuality,
+        );
+        y += step;
 
-        vbox.pack_start(&grid, true, true, 0);
+        self.draw_toggle_row(
+            y,
+            "Hardware Acceleration",
+            self.draft.recording.hardware_accel,
+            SettingsControlId::ToggleHardwareAccel,
+        );
+        y += step;
 
-        // Buttons row
-        let hbox_btns = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        hbox_btns.set_halign(gtk::Align::End);
+        self.draw_toggle_row(
+            y,
+            "Capture Mouse Cursor",
+            self.draft.recording.show_cursor,
+            SettingsControlId::ToggleShowCursor,
+        );
+        y += step;
 
-        let btn_cancel = gtk::Button::with_label("Cancel");
-        let btn_save = gtk::Button::with_label("Save Changes");
-        btn_save.style_context().add_class("suggested-action");
+        self.draw_toggle_row(
+            y,
+            "Show Recording Frame",
+            self.draft.recording.show_recording_frame,
+            SettingsControlId::ToggleRecordingFrame,
+        );
 
-        hbox_btns.pack_start(&btn_cancel, false, false, 0);
-        hbox_btns.pack_start(&btn_save, false, false, 0);
-        vbox.pack_start(&hbox_btns, false, false, 0);
+        // Section: AUDIO
+        self.draw_section_header(22, 276, "AUDIO");
+        y = 284;
 
-        let win_cancel = window.clone();
-        btn_cancel.connect_clicked(move |_| {
-            win_cancel.hide();
+        self.draw_toggle_row(
+            y,
+            "Desktop Audio Monitor",
+            self.draft.audio.capture_desktop,
+            SettingsControlId::ToggleDesktopAudio,
+        );
+        y += step;
+
+        self.draw_toggle_row(
+            y,
+            "Microphone Input",
+            self.draft.audio.capture_microphone,
+            SettingsControlId::ToggleMicAudio,
+        );
+        y += step;
+
+        self.draw_toggle_row(
+            y,
+            "RNNoise Suppression",
+            self.draft.audio.noise_suppression,
+            SettingsControlId::ToggleNoiseSuppression,
+        );
+
+        // Section: SCREENSHOT & STORAGE
+        self.draw_section_header(22, 376, "SCREENSHOT & STORAGE");
+        y = 384;
+
+        let snap_fmt = match self.draft.screenshot.default_format {
+            ImageFormat::Png => "PNG",
+            ImageFormat::Jpeg => "JPEG",
+            ImageFormat::Webp => "WebP",
+        };
+        self.draw_cycle_row(
+            y,
+            "Screenshot Format",
+            snap_fmt,
+            SettingsControlId::CycleScreenshotFormat,
+        );
+        y += step;
+
+        self.draw_toggle_row(
+            y,
+            "Copy Screenshot to Clipboard",
+            self.draft.screenshot.copy_to_clipboard,
+            SettingsControlId::ToggleCopyClipboard,
+        );
+        y += step;
+
+        let snap_dir = self.draft.storage.screenshot_dir.clone();
+        self.draw_path_row(
+            y,
+            "Screenshots Dir",
+            &snap_dir,
+            SettingsControlId::BrowseScreenshotDir,
+        );
+        y += step;
+
+        let rec_dir = self.draft.storage.recording_dir.clone();
+        self.draw_path_row(
+            y,
+            "Recordings Dir",
+            &rec_dir,
+            SettingsControlId::BrowseRecordingDir,
+        );
+
+        // Footer divider & buttons
+        self.canvas
+            .draw_sharp_rect(0, 504, SETTINGS_W, 1, [39, 39, 42, 255], None);
+
+        let save_rect = Rect::new(SETTINGS_W as i32 - 22 - 96, 515, 96, 32);
+        let cancel_rect = Rect::new(save_rect.x - 10 - 88, 515, 88, 32);
+
+        let cancel_hover = self.hovered == Some(SettingsControlId::Cancel);
+        let cancel_fill = if cancel_hover {
+            [63, 63, 70, 255]
+        } else {
+            [39, 39, 42, 255]
+        };
+        self.canvas.fill_rounded_rect(
+            cancel_rect.x as f32,
+            cancel_rect.y as f32,
+            cancel_rect.width as f32,
+            cancel_rect.height as f32,
+            6.0,
+            cancel_fill,
+            None,
+        );
+        self.draw_centered_text("Cancel", 12.5, cancel_rect, [244, 244, 245, 255]);
+        self.controls.push(ControlRect {
+            id: SettingsControlId::Cancel,
+            rect: cancel_rect,
         });
 
-        let win_save = window.clone();
-        let state_save = app_state.clone();
-        btn_save.connect_clicked(move |_| {
-            let snap_dir = std::path::PathBuf::from(entry_snap.text());
-            let rec_dir = std::path::PathBuf::from(entry_rec.text());
-            let fps = combo_fps
-                .active_id()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(60);
-            let fmt_str = combo_fmt.active_id().unwrap_or_else(|| "mp4".into());
-            let container = match fmt_str.as_str() {
-                "mkv" => ContainerFormat::Mkv,
-                "webm" => ContainerFormat::Webm,
-                _ => ContainerFormat::Mp4,
-            };
-            let cursor = switch_cursor.is_active();
-            let frame = switch_frame.is_active();
-
-            state_save.update_config(|cfg| {
-                cfg.storage.screenshot_dir = snap_dir;
-                cfg.storage.recording_dir = rec_dir;
-                cfg.recording.framerate = fps;
-                cfg.recording.container = container;
-                cfg.recording.show_cursor = cursor;
-                cfg.recording.show_recording_frame = frame;
-            });
-
-            win_save.hide();
+        let save_hover = self.hovered == Some(SettingsControlId::Save);
+        let save_fill = if save_hover {
+            [228, 228, 231, 255]
+        } else {
+            [255, 255, 255, 255]
+        };
+        self.canvas.fill_rounded_rect(
+            save_rect.x as f32,
+            save_rect.y as f32,
+            save_rect.width as f32,
+            save_rect.height as f32,
+            6.0,
+            save_fill,
+            None,
+        );
+        self.draw_centered_text("Save", 12.5, save_rect, [9, 9, 11, 255]);
+        self.controls.push(ControlRect {
+            id: SettingsControlId::Save,
+            rect: save_rect,
         });
-
-        window.add(&vbox);
-        Self { window }
     }
 
-    pub fn show(&self) {
-        self.window.show_all();
-        self.window.present();
+    fn draw_section_header(&mut self, x: i32, baseline_y: i32, title: &str) {
+        self.canvas.draw_text(
+            FontRole::Sans,
+            10.5,
+            x,
+            baseline_y,
+            title,
+            [113, 113, 122, 255],
+        );
     }
 
-    pub fn hide(&self) {
-        self.window.hide();
+    fn draw_cycle_row(&mut self, y: i32, label: &str, value: &str, id: SettingsControlId) {
+        self.canvas.draw_text(
+            FontRole::Sans,
+            12.5,
+            22,
+            y + 17,
+            label,
+            [228, 228, 231, 255],
+        );
+        let pill = Rect::new(SETTINGS_W as i32 - 22 - 196, y + 1, 196, 23);
+        let hovered = self.hovered == Some(id);
+        let bg = if hovered {
+            [52, 52, 58, 255]
+        } else {
+            [39, 39, 42, 255]
+        };
+        let border = if hovered {
+            [113, 113, 122, 255]
+        } else {
+            [63, 63, 70, 255]
+        };
+        self.canvas.fill_rounded_rect(
+            pill.x as f32,
+            pill.y as f32,
+            pill.width as f32,
+            pill.height as f32,
+            5.0,
+            bg,
+            None,
+        );
+        self.canvas.stroke_rounded_rect(
+            pill.x as f32 + 0.5,
+            pill.y as f32 + 0.5,
+            pill.width as f32 - 1.0,
+            pill.height as f32 - 1.0,
+            4.5,
+            1.0,
+            border,
+            None,
+        );
+        self.draw_centered_text(value, 12.0, pill, [244, 244, 245, 255]);
+        self.controls.push(ControlRect { id, rect: pill });
     }
+
+    fn draw_toggle_row(&mut self, y: i32, label: &str, enabled: bool, id: SettingsControlId) {
+        self.canvas.draw_text(
+            FontRole::Sans,
+            12.5,
+            22,
+            y + 17,
+            label,
+            [228, 228, 231, 255],
+        );
+        let pill = Rect::new(SETTINGS_W as i32 - 22 - 68, y + 2, 68, 22);
+        let hovered = self.hovered == Some(id);
+        let bg = if enabled {
+            if hovered {
+                [228, 228, 231, 255]
+            } else {
+                [255, 255, 255, 255]
+            }
+        } else if hovered {
+            [52, 52, 58, 255]
+        } else {
+            [39, 39, 42, 255]
+        };
+        let fg = if enabled {
+            [9, 9, 11, 255]
+        } else {
+            [161, 161, 170, 255]
+        };
+        self.canvas.fill_rounded_rect(
+            pill.x as f32,
+            pill.y as f32,
+            pill.width as f32,
+            pill.height as f32,
+            11.0,
+            bg,
+            None,
+        );
+        let txt = if enabled { "ON" } else { "OFF" };
+        self.draw_centered_text(txt, 11.5, pill, fg);
+        self.controls.push(ControlRect { id, rect: pill });
+    }
+
+    fn draw_path_row(&mut self, y: i32, label: &str, path: &Path, id: SettingsControlId) {
+        self.canvas.draw_text(
+            FontRole::Sans,
+            12.5,
+            22,
+            y + 17,
+            label,
+            [228, 228, 231, 255],
+        );
+        let browse_rect = Rect::new(SETTINGS_W as i32 - 22 - 74, y + 1, 74, 23);
+        let path_rect = Rect::new(160, y + 1, (browse_rect.x - 160 - 8).max(0) as u32, 23);
+
+        self.canvas.fill_rounded_rect(
+            path_rect.x as f32,
+            path_rect.y as f32,
+            path_rect.width as f32,
+            path_rect.height as f32,
+            5.0,
+            [30, 30, 34, 255],
+            None,
+        );
+        let truncated = compact_path(path, 34);
+        self.canvas.draw_text(
+            FontRole::Mono,
+            11.0,
+            path_rect.x + 8,
+            path_rect.y + 15,
+            &truncated,
+            [212, 212, 216, 255],
+        );
+
+        let hovered = self.hovered == Some(id);
+        let bg = if hovered {
+            [63, 63, 70, 255]
+        } else {
+            [39, 39, 42, 255]
+        };
+        self.canvas.fill_rounded_rect(
+            browse_rect.x as f32,
+            browse_rect.y as f32,
+            browse_rect.width as f32,
+            browse_rect.height as f32,
+            5.0,
+            bg,
+            None,
+        );
+        self.canvas.stroke_rounded_rect(
+            browse_rect.x as f32 + 0.5,
+            browse_rect.y as f32 + 0.5,
+            browse_rect.width as f32 - 1.0,
+            browse_rect.height as f32 - 1.0,
+            4.5,
+            1.0,
+            [63, 63, 70, 255],
+            None,
+        );
+        self.draw_centered_text("Browse", 11.5, browse_rect, [244, 244, 245, 255]);
+        self.controls.push(ControlRect {
+            id,
+            rect: browse_rect,
+        });
+    }
+
+    fn draw_centered_text(&mut self, text: &str, px: f32, rect: Rect, color: [u8; 4]) {
+        let (tw, _) = self.canvas.measure_text(FontRole::Sans, px, text);
+        let tx = rect.x + (rect.width as i32 - tw) / 2;
+        let ty = rect.y + (rect.height as i32 + (px * 0.72).round() as i32) / 2;
+        self.canvas
+            .draw_text(FontRole::Sans, px, tx, ty, text, color);
+    }
+}
+
+fn compact_path(path: &Path, max_chars: usize) -> String {
+    let s = path.to_string_lossy();
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.into_owned();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let tail: String = s
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
 }

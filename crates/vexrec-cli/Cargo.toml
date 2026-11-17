@@ -12,15 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 vexrec-core = { path = "../vexrec-core" }
-vexrec-portal = { path = "../vexrec-portal" }
-vexrec-pipeline = { path = "../vexrec-pipeline" }
+vexrec-os = { path = "../vexrec-os" }
+vexrec-display = { path = "../vexrec-display" }
+vexrec-media = { path = "../vexrec-media" }
 vexrec-ui = { path = "../vexrec-ui" }
-tokio.workspace = true
+libc.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-clap = { version = "4.5", features = ["derive"] }
-clap_complete = "4.5"
-image.workspace = true
-anyhow.workspace = true
-chrono.workspace = true
-dirs.workspace = true

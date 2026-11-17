@@ -1,0 +1,12 @@
+[package]
+name = "vexrec-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vexrec-core = { path = "../vexrec-core" }
+vexrec-os = { path = "../vexrec-os" }
+tracing.workspace = true

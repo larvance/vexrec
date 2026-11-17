@@ -5,7 +5,7 @@ set -euo pipefail
 # Installs binary, desktop launcher, application icons, and shell autocompletions.
 
 REPO="aerovexhq/vexrec"
-VERSION="0.1.0"
+VERSION="0.3.0"
 
 # Parse arguments
 PREFIX="${HOME}/.local"

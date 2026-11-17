@@ -1,0 +1,25 @@
+[package]
+name = "vexrec-display"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+vexrec-core = { path = "../vexrec-core" }
+vexrec-os = { path = "../vexrec-os" }
+x11rb.workspace = true
+wayland-client.workspace = true
+wayland-cursor.workspace = true
+wayland-protocols.workspace = true
+wayland-protocols-wlr.workspace = true
+smithay-client-toolkit.workspace = true
+calloop.workspace = true
+polling.workspace = true
+rustix.workspace = true
+libc.workspace = true
+libloading.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

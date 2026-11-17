@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::error::{VexrecError, Result};
 use crate::geometry::Rect;
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SessionState {
@@ -19,7 +21,7 @@ pub enum SessionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
-    pub id: Uuid,
+    pub id: u64,
     pub started_at: DateTime<Utc>,
     pub stopped_at: Option<DateTime<Utc>>,
     pub output_file: PathBuf,
@@ -31,7 +33,7 @@ pub struct SessionMetadata {
 impl SessionMetadata {
     pub fn new(output_file: PathBuf, target_region: Option<Rect>) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: SESSION_COUNTER.fetch_add(1, Ordering::Relaxed),
             started_at: Utc::now(),
             stopped_at: None,
             output_file,

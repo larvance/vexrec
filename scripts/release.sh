@@ -113,8 +113,8 @@ if [ "${UPLOAD}" = "true" ]; then
   else
     echo "Creating new release ${TAG}..."
     gh release create "${TAG}" "${DIST_DIR}"/* \
-      --title "vexrec ${VERSION}: Modern and Minimalistic Linux Screen Recorder and Screenshot Suite" \
-      --notes "Modern, minimalistic screen recording and screenshot application for Linux." \
+      --title "vexrec ${VERSION}: Pure-Rust Bare-Metal Linux Screen Recorder and Screenshot Suite" \
+      --notes "Pure-Rust bare-metal X11/Wayland screen recorder and screenshot utility with zero GTK, GStreamer, or tokio dependencies." \
       -R "${REPO}"
   fi
   echo "==> Release assets successfully uploaded to ${REPO} @ ${TAG}!"

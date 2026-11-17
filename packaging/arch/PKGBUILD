@@ -1,13 +1,19 @@
 # Maintainer: Aerovex HQ <dev@aerovex.net>
 pkgname=vexrec-bin
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
-pkgdesc="Modern, minimalistic screenshot and screen recorder for Linux written in Rust"
+pkgdesc="Pure-Rust bare-metal screenshot and screen recorder for Linux"
 arch=('x86_64')
 url="https://github.com/aerovexhq/vexrec"
 license=('MIT')
-depends=('gstreamer' 'gst-plugins-base' 'gst-plugins-good' 'gst-plugin-pipewire' 'pipewire' 'xdg-desktop-portal')
-provides=('vexrec' 'luxrec')
+depends=('glibc')
+optdepends=(
+    'pipewire: Wayland ScreenCast and audio capture'
+    'xdg-desktop-portal: Wayland file dialogs and global shortcuts'
+    'libva: Hardware VA-API video encoding'
+    'vulkan-icd-loader: Hardware Vulkan Video encoding'
+)
+provides=('vexrec')
 conflicts=('vexrec' 'luxrec')
 source=("https://github.com/aerovexhq/vexrec/releases/download/${pkgver}/vexrec-linux-x86_64.tar.gz")
 sha256sums=('SKIP')
@@ -15,8 +21,7 @@ sha256sums=('SKIP')
 package() {
     cd "${srcdir}"
     install -Dm755 vexrec "${pkgdir}/usr/bin/vexrec"
-    ln -sf vexrec "${pkgdir}/usr/bin/luxrec"
-    install -Dm644 vexrec.desktop "${pkgdir}/usr/share/applications/vexrec.desktop"
+    install -Dm644 data/vexrec.desktop "${pkgdir}/usr/share/applications/vexrec.desktop"
     install -Dm644 icons/32x32.png "${pkgdir}/usr/share/icons/hicolor/32x32/apps/vexrec.png"
     install -Dm644 icons/128x128.png "${pkgdir}/usr/share/icons/hicolor/128x128/apps/vexrec.png"
     install -Dm644 icons/128x128@2x.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/vexrec.png"

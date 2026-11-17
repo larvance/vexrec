@@ -1,1805 +1,1403 @@
-use gdk::prelude::*;
-use gtk::prelude::*;
-use image::{ImageBuffer, Rgba};
-use std::cell::RefCell;
-use std::rc::Rc;
-use vexrec_core::config::ensure_unique_path;
-use vexrec_core::error::VexrecError;
-use vexrec_core::geometry::Rect;
-use vexrec_pipeline::snapshot::SnapshotEngine;
-use vexrec_pipeline::x11_capture::X11CaptureEngine;
-use vexrec_portal::PortalClient;
-use crate::app_state::{expand_path, AppState};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use vexrec_core::buffer::PixelImage;
+use vexrec_core::config::VexrecConfig;
+use vexrec_core::geometry::{Point, Rect};
+use vexrec_display::{ClientWindowInfo, CursorKind, DisplayBackend, KeyAction, WindowRole};
+use vexrec_os::fonts::{FontEngine, FontRole};
+use vexrec_render::SurfaceCanvas;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TargetMode {
-    Selection,
-    Window,
-    WindowRegion,
-    Fullscreen,
-}
+use crate::state::{
+    apply_drag_delta, compute_window_mosaic, compute_zoom_target_rect, ease_out_cubic_rect,
+    extract_window_crop_or_fallback, hit_test_selection_handle, ActionMode, DragHandle,
+    PillButtonId, PillButtonRect, SelectionAnchor, TargetMode, WindowCardLayout,
+};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ActionMode {
-    Screenshot,
-    Record,
-}
+pub const ZOOM_DURATION_MS: u64 = 220;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DragHandle {
+#[derive(Debug)]
+pub enum OverlayOutcome {
     None,
-    New,
-    Move,
-    Nw,
-    N,
-    Ne,
-    E,
-    Se,
-    S,
-    Sw,
-    W,
+    Cancel,
+    CaptureScreenshot { img: PixelImage, save_as: bool },
+    StartRecording { crop: Option<Rect>, record_mic: bool, record_desktop: bool },
+    OpenSettings,
+    RefreshCapture,
 }
 
-#[derive(Clone)]
-pub struct OverviewWindow {
-    pub xid: u32,
-    pub title: String,
-    pub class_name: String,
-    pub screen_rect: Rect,
-    pub slot_rect: (f64, f64, f64, f64),
-    pub thumbnail: Option<gdk_pixbuf::Pixbuf>,
-    pub sub_pixbuf: Option<gdk_pixbuf::Pixbuf>,
-    pub icon: Option<gdk_pixbuf::Pixbuf>,
-    pub live_image: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
-    pub full_pixbuf: Option<gdk_pixbuf::Pixbuf>,
-}
-
-#[derive(Clone)]
-pub struct ZoomAnimation {
-    pub start_time: std::time::Instant,
-    pub duration: std::time::Duration,
-    pub from_rect: (f64, f64, f64, f64),
-    pub to_rect: (f64, f64, f64, f64),
-    pub window_idx: usize,
-}
-
-struct OverlayInner {
-    image: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
-    pixbuf: Option<gdk_pixbuf::Pixbuf>,
-    crop: Option<Rect>,
+pub struct FreezeOverlayController {
+    canvas: SurfaceCanvas,
+    visible: bool,
+    screen_w: u32,
+    screen_h: u32,
     action_mode: ActionMode,
     target_mode: TargetMode,
     mic_enabled: bool,
-    desktop_audio_enabled: bool,
-    drag_handle: DragHandle,
-    drag_start: (f64, f64),
-    initial_crop: Option<Rect>,
-    mouse_pos: (f64, f64),
-    windows: Vec<OverviewWindow>,
-    hovered_window: Option<usize>,
-    zoom_animation: Option<ZoomAnimation>,
-    window_region_selected: Option<usize>,
+    audio_enabled: bool,
+    desktop: Option<PixelImage>,
+    selection: Option<Rect>,
+    drag_anchor: Option<SelectionAnchor>,
+    cards: Vec<WindowCardLayout>,
+    hovered_card: Option<usize>,
+    zoomed_card: Option<usize>,
+    zoom_from: Rect,
+    zoom_to: Rect,
+    zoom_start: Option<Instant>,
+    zoom_selection: Option<Rect>,
+    pill_rect: Rect,
+    pill_buttons: Vec<PillButtonRect>,
+    hovered_btn: Option<PillButtonId>,
+    last_cursor: Option<CursorKind>,
 }
 
-#[derive(Clone)]
-pub struct FreezeOverlayWindow {
-    window: gtk::Window,
-    drawing_area: gtk::DrawingArea,
-    inner: Rc<RefCell<OverlayInner>>,
-    app_state: AppState,
-    btn_done: gtk::Button,
-    btn_save_as: gtk::Button,
-    btn_record_action: gtk::Button,
-    btn_mic: gtk::Button,
-    btn_desktop_audio: gtk::Button,
-    audio_box: gtk::Box,
-    btn_mode_screenshot: gtk::Button,
-    btn_mode_record: gtk::Button,
-    btn_tgt_selection: gtk::Button,
-    btn_tgt_window: gtk::Button,
-    btn_tgt_window_region: gtk::Button,
-    btn_tgt_fullscreen: gtk::Button,
-    on_start_recording: Rc<dyn Fn(Option<Rect>, bool, bool)>,
-}
-
-fn rounded_rectangle(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
-    let r = r.min(w / 2.0).min(h / 2.0);
-    let degrees = std::f64::consts::PI / 180.0;
-    cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -90.0 * degrees, 0.0 * degrees);
-    cr.arc(x + w - r, y + h - r, r, 0.0 * degrees, 90.0 * degrees);
-    cr.arc(x + r, y + h - r, r, 90.0 * degrees, 180.0 * degrees);
-    cr.arc(x + r, y + r, r, 180.0 * degrees, 270.0 * degrees);
-    cr.close_path();
-}
-
-fn layout_overview_windows(windows: &mut [OverviewWindow], screen_w: f64, screen_h: f64) {
-    let n = windows.len();
-    if n == 0 {
-        return;
-    }
-
-    let margin_x = 70.0;
-    let margin_top = 85.0;
-    let margin_bottom = 115.0;
-    let avail_w = (screen_w - 2.0 * margin_x).max(100.0);
-    let avail_h = (screen_h - margin_top - margin_bottom).max(100.0);
-
-    let (rows, cols) = match n {
-        1 => (1, 1),
-        2 => (1, 2),
-        3 => (1, 3),
-        4 => (2, 2),
-        5 | 6 => (2, 3),
-        7 | 8 => (2, 4),
-        9..=12 => (3, 4),
-        _ => (3, ((n + 2) / 3).max(4)),
-    };
-
-    let gap_x = 28.0;
-    let gap_y = 36.0;
-
-    let cell_h = ((avail_h - (rows - 1) as f64 * gap_y) / rows as f64).max(50.0);
-    let cell_w = ((avail_w - (cols - 1) as f64 * gap_x) / cols as f64).max(50.0);
-
-    let mut row_counts = vec![n / rows; rows];
-    let remainder = n % rows;
-    for i in 0..remainder {
-        row_counts[i] += 1;
-    }
-
-    let mut current_idx = 0;
-    for (r, &count) in row_counts.iter().enumerate() {
-        if count == 0 {
-            continue;
-        }
-        let row_total_w = count as f64 * cell_w + (count - 1) as f64 * gap_x;
-        let row_start_x = margin_x + (avail_w - row_total_w) / 2.0;
-        let row_start_y = margin_top + r as f64 * (cell_h + gap_y);
-
-        for j in 0..count {
-            if current_idx >= windows.len() {
-                break;
-            }
-            let cx = row_start_x + j as f64 * (cell_w + gap_x);
-            let cy = row_start_y;
-
-            let win = &mut windows[current_idx];
-            let native_w = win.screen_rect.width as f64;
-            let native_h = win.screen_rect.height as f64;
-
-            let scale = (cell_w / native_w.max(1.0)).min(cell_h / native_h.max(1.0)).min(1.0);
-            let thumb_w = (native_w * scale).round().max(20.0);
-            let thumb_h = (native_h * scale).round().max(20.0);
-            let thumb_x = (cx + (cell_w - thumb_w) / 2.0).round();
-            let thumb_y = (cy + (cell_h - thumb_h) / 2.0).round();
-
-            win.slot_rect = (thumb_x, thumb_y, thumb_w, thumb_h);
-            current_idx += 1;
-        }
-    }
-}
-
-fn build_overview_windows(
-    win_infos: Vec<vexrec_pipeline::x11_capture::WindowInfo>,
-    screen_w: f64,
-    screen_h: f64,
-    fallback_pb: Option<&gdk_pixbuf::Pixbuf>,
-) -> Vec<OverviewWindow> {
-    let mut overview_windows = Vec::new();
-
-    for info in win_infos {
-        let (full_pb, live_img) = if let Some(ref img) = info.live_image {
-            let (lw, lh) = img.dimensions();
-            let raw = img.clone().into_raw();
-            let bytes = glib::Bytes::from(&raw);
-            let pb = gdk_pixbuf::Pixbuf::from_bytes(
-                &bytes,
-                gdk_pixbuf::Colorspace::Rgb,
-                true,
-                8,
-                lw as i32,
-                lh as i32,
-                (lw * 4) as i32,
-            );
-            (Some(pb), Some(img.clone()))
-        } else if let Some(root_pb) = fallback_pb {
-            let px = info.rect.x.clamp(0, (screen_w as i32 - 1).max(0));
-            let py = info.rect.y.clamp(0, (screen_h as i32 - 1).max(0));
-            let pw = (info.rect.width as i32).min(screen_w as i32 - px).max(1);
-            let ph = (info.rect.height as i32).min(screen_h as i32 - py).max(1);
-            let sub = root_pb.new_subpixbuf(px, py, pw, ph);
-            (Some(sub), None)
-        } else {
-            (None, None)
-        };
-
-        let icon_pb = if let Some((iw, ih, ref rgba)) = info.icon_rgba {
-            let icon_bytes = glib::Bytes::from(rgba);
-            let pb = gdk_pixbuf::Pixbuf::from_bytes(
-                &icon_bytes,
-                gdk_pixbuf::Colorspace::Rgb,
-                true,
-                8,
-                iw as i32,
-                ih as i32,
-                (iw * 4) as i32,
-            );
-            pb.scale_simple(42, 42, gdk_pixbuf::InterpType::Bilinear)
-        } else {
-            gtk::IconTheme::default().and_then(|t| {
-                t.load_icon(&info.class_name.to_lowercase(), 42, gtk::IconLookupFlags::GENERIC_FALLBACK).ok().flatten()
-            })
-        };
-
-        overview_windows.push(OverviewWindow {
-            xid: info.xid,
-            title: info.title,
-            class_name: info.class_name,
-            screen_rect: info.rect,
-            slot_rect: (0.0, 0.0, 0.0, 0.0),
-            thumbnail: None,
-            sub_pixbuf: full_pb.clone(),
-            icon: icon_pb,
-            live_image: live_img,
-            full_pixbuf: full_pb,
-        });
-    }
-
-    layout_overview_windows(&mut overview_windows, screen_w, screen_h);
-
-    for ow in &mut overview_windows {
-        let (_, _, sw, sh) = ow.slot_rect;
-        if let Some(ref fpb) = ow.full_pixbuf {
-            ow.thumbnail = fpb.scale_simple(sw.max(1.0) as i32, sh.max(1.0) as i32, gdk_pixbuf::InterpType::Bilinear);
-        }
-    }
-
-    overview_windows
-}
-
-impl FreezeOverlayWindow {
-    pub fn new<FStartRec, FOpenSettings>(
-        app_state: AppState,
-        on_start_recording: FStartRec,
-        on_open_settings: FOpenSettings,
-    ) -> Rc<Self>
-    where
-        FStartRec: Fn(Option<Rect>, bool, bool) + 'static,
-        FOpenSettings: Fn() + 'static,
-    {
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_title("Vexrec Capture");
-        window.set_decorated(false);
-        window.set_skip_taskbar_hint(true);
-        window.set_skip_pager_hint(true);
-        window.set_keep_above(true);
-        window.set_app_paintable(true);
-        window.set_can_focus(true);
-        window.set_accept_focus(true);
-        window.set_focus_on_map(true);
-        window.set_modal(true);
-        window.fullscreen();
-
-        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
-            if let Some(visual) = screen.rgba_visual() {
-                window.set_visual(Some(&visual));
-            }
-        }
-
-        let inner = Rc::new(RefCell::new(OverlayInner {
-            image: None,
-            pixbuf: None,
-            crop: None,
+impl FreezeOverlayController {
+    pub fn new(fonts: Arc<FontEngine>) -> Self {
+        Self {
+            canvas: SurfaceCanvas::new(1920, 1080, fonts),
+            visible: false,
+            screen_w: 1920,
+            screen_h: 1080,
             action_mode: ActionMode::Screenshot,
             target_mode: TargetMode::Selection,
-            mic_enabled: true,
-            desktop_audio_enabled: true,
-            drag_handle: DragHandle::None,
-            drag_start: (0.0, 0.0),
-            initial_crop: None,
-            mouse_pos: (0.0, 0.0),
-            windows: Vec::new(),
-            hovered_window: None,
-            zoom_animation: None,
-            window_region_selected: None,
-        }));
+            mic_enabled: false,
+            audio_enabled: true,
+            desktop: None,
+            selection: None,
+            drag_anchor: None,
+            cards: Vec::new(),
+            hovered_card: None,
+            zoomed_card: None,
+            zoom_from: Rect::default(),
+            zoom_to: Rect::default(),
+            zoom_start: None,
+            zoom_selection: None,
+            pill_rect: Rect::default(),
+            pill_buttons: Vec::new(),
+            hovered_btn: None,
+            last_cursor: None,
+        }
+    }
 
-        let overlay_container = gtk::Overlay::new();
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
 
-        let drawing_area = gtk::DrawingArea::new();
-        drawing_area.set_can_focus(true);
-        drawing_area.add_events(
-            gdk::EventMask::BUTTON_PRESS_MASK
-                | gdk::EventMask::BUTTON_RELEASE_MASK
-                | gdk::EventMask::POINTER_MOTION_MASK
-                | gdk::EventMask::KEY_PRESS_MASK
-                | gdk::EventMask::LEAVE_NOTIFY_MASK,
+    pub fn is_animating(&self) -> bool {
+        if let Some(start) = self.zoom_start {
+            start.elapsed() < Duration::from_millis(ZOOM_DURATION_MS)
+        } else {
+            false
+        }
+    }
+
+    pub fn pill_buttons(&self) -> &[PillButtonRect] {
+        &self.pill_buttons
+    }
+
+    pub fn action_mode(&self) -> ActionMode {
+        self.action_mode
+    }
+
+    pub fn target_mode(&self) -> TargetMode {
+        self.target_mode
+    }
+
+    /// Shows the fullscreen freeze overlay. Always resets `ActionMode::Screenshot` cleanly.
+    pub fn show(
+        &mut self,
+        backend: &mut dyn DisplayBackend,
+        cfg: &VexrecConfig,
+        desktop: PixelImage,
+        windows: Vec<ClientWindowInfo>,
+    ) {
+        let sz = backend.primary_size();
+        self.screen_w = desktop.width.max(sz.width).max(1);
+        self.screen_h = desktop.height.max(sz.height).max(1);
+        self.canvas.resize(self.screen_w, self.screen_h);
+
+        // Enforce Screenshot mode default every time overlay opens
+        self.action_mode = ActionMode::Screenshot;
+        self.target_mode = match cfg.screenshot.last_mode.as_deref() {
+            Some("window") => TargetMode::Window,
+            Some("window_region") => TargetMode::WindowRegion,
+            Some("fullscreen") => TargetMode::Fullscreen,
+            _ => TargetMode::Selection,
+        };
+        self.mic_enabled = cfg.audio.capture_microphone;
+        self.audio_enabled = cfg.audio.capture_desktop;
+        self.desktop = Some(desktop);
+
+        self.selection = cfg.screenshot.last_region.and_then(|r| {
+            let clamped = r.clamp_bounds(self.screen_w, self.screen_h);
+            if clamped.width >= 16 && clamped.height >= 16 {
+                Some(clamped)
+            } else {
+                None
+            }
+        });
+        self.drag_anchor = None;
+        self.cards = compute_window_mosaic(&windows, self.screen_w, self.screen_h);
+        self.hovered_card = None;
+        self.zoomed_card = None;
+        self.zoom_start = None;
+        self.zoom_selection = None;
+        self.hovered_btn = None;
+        self.last_cursor = None;
+        self.visible = true;
+
+        self.layout_pill();
+        self.render(None);
+
+        backend.show_surface(
+            WindowRole::OverlayFullscreen,
+            Rect::new(0, 0, self.screen_w, self.screen_h),
         );
-
-        overlay_container.add(&drawing_area);
-
-        // Floating Bottom Control Pill
-        let bottom_pill = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        bottom_pill.style_context().add_class("freeze-pill");
-        bottom_pill.set_halign(gtk::Align::Center);
-        bottom_pill.set_valign(gtk::Align::End);
-        bottom_pill.set_margin_bottom(32);
-
-        let provider = gtk::CssProvider::new();
-        if provider.load_from_data(crate::DARK_CSS.as_bytes()).is_ok() {
-            bottom_pill.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
-            window.style_context().add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_USER);
-        }
-
-        // 1. Mode Switcher (Screenshot vs Record)
-        let mode_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        mode_box.style_context().add_class("pill-group");
-
-        let btn_mode_screenshot = gtk::Button::with_label("Screenshot");
-        btn_mode_screenshot.set_can_focus(false);
-        btn_mode_screenshot.style_context().add_class("pill-button");
-        btn_mode_screenshot.style_context().add_class("active");
-
-        let btn_mode_record = gtk::Button::with_label("Record");
-        btn_mode_record.set_can_focus(false);
-        btn_mode_record.style_context().add_class("pill-button");
-
-        mode_box.pack_start(&btn_mode_screenshot, false, false, 0);
-        mode_box.pack_start(&btn_mode_record, false, false, 0);
-        bottom_pill.pack_start(&mode_box, false, false, 0);
-
-        let sep1 = gtk::Separator::new(gtk::Orientation::Vertical);
-        sep1.style_context().add_class("pill-separator");
-        bottom_pill.pack_start(&sep1, false, false, 0);
-
-        // 2. Target Switcher (Selection, Window, Window Region, Fullscreen)
-        let target_box = gtk::Box::new(gtk::Orientation::Horizontal, 2);
-        target_box.style_context().add_class("pill-group");
-
-        let btn_tgt_selection = gtk::Button::with_label("Selection (1)");
-        btn_tgt_selection.set_can_focus(false);
-        btn_tgt_selection.style_context().add_class("pill-button");
-        btn_tgt_selection.style_context().add_class("active");
-
-        let btn_tgt_window = gtk::Button::with_label("Window (2)");
-        btn_tgt_window.set_can_focus(false);
-        btn_tgt_window.style_context().add_class("pill-button");
-
-        let btn_tgt_window_region = gtk::Button::with_label("Window Region (3)");
-        btn_tgt_window_region.set_can_focus(false);
-        btn_tgt_window_region.style_context().add_class("pill-button");
-
-        let btn_tgt_fullscreen = gtk::Button::with_label("Full Screen (4)");
-        btn_tgt_fullscreen.set_can_focus(false);
-        btn_tgt_fullscreen.style_context().add_class("pill-button");
-
-        target_box.pack_start(&btn_tgt_selection, false, false, 0);
-        target_box.pack_start(&btn_tgt_window, false, false, 0);
-        target_box.pack_start(&btn_tgt_window_region, false, false, 0);
-        target_box.pack_start(&btn_tgt_fullscreen, false, false, 0);
-        bottom_pill.pack_start(&target_box, false, false, 0);
-
-        // 3. Audio Toggles (shown when Record mode)
-        let audio_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        audio_box.style_context().add_class("pill-group");
-
-        let btn_mic = gtk::Button::with_label("Mic: ON");
-        btn_mic.set_can_focus(false);
-        btn_mic.style_context().add_class("pill-button");
-        btn_mic.style_context().add_class("active");
-
-        let btn_desktop_audio = gtk::Button::with_label("Audio: ON");
-        btn_desktop_audio.set_can_focus(false);
-        btn_desktop_audio.style_context().add_class("pill-button");
-        btn_desktop_audio.style_context().add_class("active");
-
-        audio_box.pack_start(&btn_mic, false, false, 0);
-        audio_box.pack_start(&btn_desktop_audio, false, false, 0);
-        audio_box.set_no_show_all(true);
-        audio_box.hide();
-        bottom_pill.pack_start(&audio_box, false, false, 0);
-
-        let sep2 = gtk::Separator::new(gtk::Orientation::Vertical);
-        sep2.style_context().add_class("pill-separator");
-        bottom_pill.pack_start(&sep2, false, false, 0);
-
-        // 4. Action Buttons
-        let btn_done = gtk::Button::with_label("Done ↵");
-        btn_done.set_can_focus(false);
-        btn_done.style_context().add_class("action-btn-done");
-        bottom_pill.pack_start(&btn_done, false, false, 0);
-
-        let btn_save_as = gtk::Button::with_label("Save As");
-        btn_save_as.set_can_focus(false);
-        btn_save_as.style_context().add_class("pill-button");
-        bottom_pill.pack_start(&btn_save_as, false, false, 0);
-
-        let btn_record_action = gtk::Button::with_label("Record ↵");
-        btn_record_action.set_can_focus(false);
-        btn_record_action.style_context().add_class("action-btn-record");
-        btn_record_action.set_no_show_all(true);
-        btn_record_action.hide();
-        bottom_pill.pack_start(&btn_record_action, false, false, 0);
-
-        // 5. Settings button
-        let btn_settings = gtk::Button::with_label("Settings");
-        btn_settings.set_can_focus(false);
-        btn_settings.style_context().add_class("pill-button");
-        bottom_pill.pack_start(&btn_settings, false, false, 0);
-
-        // 6. Cancel button
-        let btn_cancel = gtk::Button::with_label("Cancel (Esc)");
-        btn_cancel.set_can_focus(false);
-        btn_cancel.style_context().add_class("pill-button");
-        bottom_pill.pack_start(&btn_cancel, false, false, 0);
-
-        overlay_container.add_overlay(&bottom_pill);
-        overlay_container.set_overlay_pass_through(&bottom_pill, false);
-
-        window.add(&overlay_container);
-
-        let on_start_rec_rc: Rc<dyn Fn(Option<Rect>, bool, bool)> = Rc::new(on_start_recording);
-
-        let overlay = Rc::new(Self {
-            window,
-            drawing_area,
-            inner,
-            app_state,
-            btn_done,
-            btn_save_as,
-            btn_record_action,
-            btn_mic,
-            btn_desktop_audio,
-            audio_box,
-            btn_mode_screenshot,
-            btn_mode_record,
-            btn_tgt_selection,
-            btn_tgt_window,
-            btn_tgt_window_region,
-            btn_tgt_fullscreen,
-            on_start_recording: on_start_rec_rc,
-        });
-
-        // Set up Draw signal
-        let inner_draw = overlay.inner.clone();
-        overlay.drawing_area.connect_draw(move |_da, cr| {
-            let inner = inner_draw.borrow();
-            let win_w = _da.allocated_width() as f64;
-            let win_h = _da.allocated_height() as f64;
-
-            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
-                && inner.window_region_selected.is_none()
-                && inner.zoom_animation.is_none();
-
-            if let Some(ref anim) = inner.zoom_animation {
-                // Smooth Zoom Animation
-                let elapsed = anim.start_time.elapsed().as_secs_f64() / anim.duration.as_secs_f64();
-                let t = (1.0 - (1.0 - elapsed.clamp(0.0, 1.0)).powi(3)).clamp(0.0, 1.0);
-
-                if let Some(ref pb) = inner.pixbuf {
-                    cr.set_source_pixbuf(pb, 0.0, 0.0);
-                    let _ = cr.paint();
-                }
-
-                let alpha_mask = 0.78 * (1.0 - t) + 0.45 * t;
-                cr.set_source_rgba(0.06, 0.06, 0.09, alpha_mask);
-                cr.rectangle(0.0, 0.0, win_w, win_h);
-                let _ = cr.fill();
-
-                let other_alpha = (1.0 - t).max(0.0);
-                if other_alpha > 0.01 {
-                    for (idx, win) in inner.windows.iter().enumerate() {
-                        if idx == anim.window_idx {
-                            continue;
-                        }
-                        let (sx, sy, sw, sh) = win.slot_rect;
-                        rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
-                        cr.save().unwrap();
-                        cr.clip();
-                        if let Some(ref thumb) = win.thumbnail {
-                            cr.set_source_pixbuf(thumb, sx, sy);
-                            let _ = cr.paint_with_alpha(other_alpha);
-                        }
-                        cr.restore().unwrap();
-
-                        rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
-                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.18 * other_alpha);
-                        cr.set_line_width(1.0);
-                        let _ = cr.stroke();
-                    }
-                }
-
-                if let Some(win) = inner.windows.get(anim.window_idx) {
-                    let (fx, fy, fw, fh) = anim.from_rect;
-                    let (tx, ty, tw, th) = anim.to_rect;
-                    let cur_x = fx + (tx - fx) * t;
-                    let cur_y = fy + (ty - fy) * t;
-                    let cur_w = fw + (tw - fw) * t;
-                    let cur_h = fh + (th - fh) * t;
-                    let corner_r = 10.0 * (1.0 - t);
-
-                    rounded_rectangle(cr, cur_x, cur_y, cur_w, cur_h, corner_r);
-                    cr.save().unwrap();
-                    cr.clip();
-                    if let Some(ref fpb) = win.full_pixbuf {
-                        let fw = fpb.width() as f64;
-                        let fh = fpb.height() as f64;
-                        cr.translate(cur_x, cur_y);
-                        cr.scale(cur_w / fw, cur_h / fh);
-                        cr.set_source_pixbuf(fpb, 0.0, 0.0);
-                        let _ = cr.paint();
-                    } else if let Some(ref pb) = inner.pixbuf {
-                        let sx = win.screen_rect.x as f64;
-                        let sy = win.screen_rect.y as f64;
-                        let sw = win.screen_rect.width as f64;
-                        let sh = win.screen_rect.height as f64;
-                        cr.translate(cur_x, cur_y);
-                        cr.scale(cur_w / sw, cur_h / sh);
-                        cr.set_source_pixbuf(pb, -sx, -sy);
-                        let _ = cr.paint();
-                    }
-                    cr.restore().unwrap();
-
-                    rounded_rectangle(cr, cur_x, cur_y, cur_w, cur_h, corner_r);
-                    cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
-                    cr.set_line_width(2.5);
-                    let _ = cr.stroke();
-
-                    if let Some(ref icon) = win.icon {
-                        let icon_alpha = (1.0 - t * 1.5).max(0.0);
-                        if icon_alpha > 0.01 {
-                            let ix = (cur_x + cur_w / 2.0 - 21.0).round();
-                            let iy = (cur_y + cur_h - 21.0).round();
-                            cr.set_source_pixbuf(icon, ix, iy);
-                            let _ = cr.paint_with_alpha(icon_alpha);
-                        }
-                    }
-                }
-            } else if is_overview {
-                if let Some(ref pb) = inner.pixbuf {
-                    cr.set_source_pixbuf(pb, 0.0, 0.0);
-                    let _ = cr.paint();
-                }
-
-                // Dark ambient backdrop matching GNOME Activities overview
-                cr.set_source_rgba(0.06, 0.06, 0.09, 0.78);
-                cr.rectangle(0.0, 0.0, win_w, win_h);
-                let _ = cr.fill();
-
-                let header_text = if inner.target_mode == TargetMode::Window {
-                    if inner.action_mode == ActionMode::Record {
-                        "Click a window to record"
-                    } else {
-                        "Click a window to capture"
-                    }
-                } else {
-                    if inner.action_mode == ActionMode::Record {
-                        "Click a window to record a region"
-                    } else {
-                        "Click a window to select a region"
-                    }
-                };
-                cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                cr.set_font_size(13.0);
-                if let Ok(extents) = cr.text_extents(header_text) {
-                    let bw = extents.width() + 36.0;
-                    let bh = 32.0;
-                    let bx = (win_w - bw) / 2.0;
-                    let by = 36.0;
-                    rounded_rectangle(cr, bx, by, bw, bh, 16.0);
-                    cr.set_source_rgba(0.12, 0.12, 0.16, 0.92);
-                    let _ = cr.fill();
-                    rounded_rectangle(cr, bx, by, bw, bh, 16.0);
-                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
-                    cr.set_line_width(1.0);
-                    let _ = cr.stroke();
-
-                    cr.set_source_rgb(0.9, 0.9, 0.95);
-                    cr.move_to(bx + 18.0, by + 21.0);
-                    let _ = cr.show_text(header_text);
-                }
-
-                // Draw Windows Grid
-                for (idx, win) in inner.windows.iter().enumerate() {
-                    let is_hovered = inner.hovered_window == Some(idx);
-                    let (sx, sy, sw, sh) = win.slot_rect;
-
-                    // Hover Glow / Shadow
-                    if is_hovered {
-                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.25);
-                        rounded_rectangle(cr, sx - 4.0, sy - 4.0, sw + 8.0, sh + 8.0, 14.0);
-                        let _ = cr.fill();
-                    }
-
-                    // Card Base Background
-                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
-                    cr.set_source_rgba(0.12, 0.12, 0.16, 0.85);
-                    let _ = cr.fill();
-
-                    // Card Thumbnail
-                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
-                    cr.save().unwrap();
-                    cr.clip();
-                    if let Some(ref thumb) = win.thumbnail {
-                        cr.set_source_pixbuf(thumb, sx, sy);
-                        let _ = cr.paint();
-                    }
-                    cr.restore().unwrap();
-
-                    // Card Border
-                    rounded_rectangle(cr, sx, sy, sw, sh, 10.0);
-                    if is_hovered {
-                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
-                        cr.set_line_width(2.5);
-                    } else {
-                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.20);
-                        cr.set_line_width(1.0);
-                    }
-                    let _ = cr.stroke();
-
-                    // Centered Application Icon Badge floating at bottom edge
-                    let icon_size = 42.0;
-                    let ix = (sx + sw / 2.0 - icon_size / 2.0).round();
-                    let iy = (sy + sh - icon_size / 2.0).round();
-
-                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.4);
-                    cr.arc(ix + icon_size / 2.0, iy + icon_size / 2.0 + 2.0, icon_size / 2.0 + 2.0, 0.0, 2.0 * std::f64::consts::PI);
-                    let _ = cr.fill();
-
-                    if let Some(ref icon) = win.icon {
-                        cr.set_source_pixbuf(icon, ix, iy);
-                        let _ = cr.paint();
-                    }
-
-                    // Hover Tooltip Badge above thumbnail
-                    if is_hovered && !win.title.is_empty() {
-                        let mut title_text = win.title.clone();
-                        if title_text.len() > 45 {
-                            title_text.truncate(42);
-                            title_text.push_str("...");
-                        }
-                        cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                        cr.set_font_size(12.0);
-                        if let Ok(extents) = cr.text_extents(&title_text) {
-                            let tw = extents.width() + 24.0;
-                            let th = 26.0;
-                            let tx = (sx + sw / 2.0 - tw / 2.0).max(8.0).min(win_w - tw - 8.0);
-                            let ty = (sy - th - 8.0).max(8.0);
-
-                            rounded_rectangle(cr, tx, ty, tw, th, 13.0);
-                            cr.set_source_rgba(0.09, 0.09, 0.12, 0.95);
-                            let _ = cr.fill();
-                            rounded_rectangle(cr, tx, ty, tw, th, 13.0);
-                            cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
-                            cr.set_line_width(1.0);
-                            let _ = cr.stroke();
-
-                            cr.set_source_rgb(1.0, 1.0, 1.0);
-                            cr.move_to(tx + 12.0, ty + 18.0);
-                            let _ = cr.show_text(&title_text);
-                        }
-                    }
-                }
-            } else {
-                // Free Selection Mode or Zoomed Window Region
-                if let Some(ref pb) = inner.pixbuf {
-                    cr.set_source_pixbuf(pb, 0.0, 0.0);
-                    let _ = cr.paint();
-                }
-
-                if let Some(win_idx) = inner.window_region_selected {
-                    if let Some(win) = inner.windows.get(win_idx) {
-                        if let Some(ref fpb) = win.full_pixbuf {
-                            cr.set_source_pixbuf(fpb, win.screen_rect.x as f64, win.screen_rect.y as f64);
-                            let _ = cr.paint();
-                        }
-                    }
-                }
-
-                // Vignette Mask
-                if inner.target_mode != TargetMode::Fullscreen {
-                    cr.set_fill_rule(cairo::FillRule::EvenOdd);
-                    cr.rectangle(0.0, 0.0, win_w, win_h);
-                    if let Some(r) = inner.crop {
-                        cr.rectangle(r.x as f64, r.y as f64, r.width as f64, r.height as f64);
-                    }
-                    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
-                    let _ = cr.fill();
-                }
-
-                // Header badge in Window Region Mode
-                if inner.target_mode == TargetMode::WindowRegion && inner.window_region_selected.is_some() {
-                    let win_idx = inner.window_region_selected.unwrap();
-                    let win_title = inner.windows.get(win_idx).map(|w| w.title.as_str()).unwrap_or("Window");
-                    let mut hint_title = win_title.to_string();
-                    if hint_title.len() > 35 {
-                        hint_title.truncate(32);
-                        hint_title.push_str("...");
-                    }
-                    let mode_str = if inner.action_mode == ActionMode::Record { "Record" } else { "Capture" };
-                    let hint_text = format!("{} Region: {} — Esc to Overview", mode_str, hint_title);
-                    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                    cr.set_font_size(12.0);
-                    if let Ok(extents) = cr.text_extents(&hint_text) {
-                        let bw = extents.width() + 32.0;
-                        let bh = 28.0;
-                        let bx = (win_w - bw) / 2.0;
-                        let by = 36.0;
-                        rounded_rectangle(cr, bx, by, bw, bh, 14.0);
-                        cr.set_source_rgba(0.09, 0.09, 0.12, 0.92);
-                        let _ = cr.fill();
-                        rounded_rectangle(cr, bx, by, bw, bh, 14.0);
-                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.7);
-                        cr.set_line_width(1.0);
-                        let _ = cr.stroke();
-
-                        cr.set_source_rgb(0.9, 0.9, 0.95);
-                        cr.move_to(bx + 16.0, by + 19.0);
-                        let _ = cr.show_text(&hint_text);
-                    }
-                }
-
-                // Selection Rect & Handles
-                if inner.target_mode == TargetMode::Fullscreen {
-                    // Fullscreen: clean screen preview without any surrounding border box
-                } else if let Some(r) = inner.crop {
-                    if r.width > 2 && r.height > 2 {
-                        let rx = r.x as f64;
-                        let ry = r.y as f64;
-                        let rw = r.width as f64;
-                        let rh = r.height as f64;
-
-                        // Border
-                        cr.set_source_rgba(0.388, 0.400, 0.945, 0.95);
-                        cr.set_line_width(2.0);
-                        cr.rectangle(rx, ry, rw, rh);
-                        let _ = cr.stroke();
-
-                        // 8 Handles
-                        let draw_handle = |cr: &cairo::Context, hx: f64, hy: f64| {
-                            cr.set_source_rgb(1.0, 1.0, 1.0);
-                            cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
-                            let _ = cr.fill();
-                            cr.set_source_rgb(0.388, 0.400, 0.945);
-                            cr.set_line_width(1.5);
-                            cr.rectangle(hx - 4.0, hy - 4.0, 8.0, 8.0);
-                            let _ = cr.stroke();
-                        };
-
-                        draw_handle(cr, rx, ry); // NW
-                        draw_handle(cr, rx + rw / 2.0, ry); // N
-                        draw_handle(cr, rx + rw, ry); // NE
-                        draw_handle(cr, rx + rw, ry + rh / 2.0); // E
-                        draw_handle(cr, rx + rw, ry + rh); // SE
-                        draw_handle(cr, rx + rw / 2.0, ry + rh); // S
-                        draw_handle(cr, rx, ry + rh); // SW
-                        draw_handle(cr, rx, ry + rh / 2.0); // W
-
-                        // Dimension Tooltip Badge
-                        let text = format!("{} × {} px", r.width, r.height);
-                        cr.select_font_face("Monospace", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
-                        cr.set_font_size(11.0);
-                        let extents = cr.text_extents(&text).unwrap();
-
-                        let badge_w = extents.width() + 16.0;
-                        let badge_h = 22.0;
-                        let badge_x = rx.max(4.0).min(win_w - badge_w - 4.0);
-                        let badge_y = (ry - badge_h - 6.0).max(4.0);
-
-                        // Badge background
-                        cr.set_source_rgba(0.094, 0.094, 0.106, 0.92);
-                        cr.rectangle(badge_x, badge_y, badge_w, badge_h);
-                        let _ = cr.fill();
-                        cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
-                        cr.set_line_width(1.0);
-                        cr.rectangle(badge_x, badge_y, badge_w, badge_h);
-                        let _ = cr.stroke();
-
-                        // Badge text
-                        cr.set_source_rgb(1.0, 1.0, 1.0);
-                        cr.move_to(badge_x + 8.0, badge_y + 15.0);
-                        let _ = cr.show_text(&text);
-                    }
-                }
-            }
-
-            glib::Propagation::Proceed
-        });
-
-        // Set up Mouse Events
-        let ov_press = overlay.clone();
-        let da_press = overlay.drawing_area.clone();
-        overlay.drawing_area.connect_button_press_event(move |_da, ev| {
-            if ev.button() != 1 {
-                return glib::Propagation::Proceed;
-            }
-            let (ex, ey) = ev.position();
-            let mut inner = ov_press.inner.borrow_mut();
-
-            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
-                && inner.window_region_selected.is_none()
-                && inner.zoom_animation.is_none();
-
-            if is_overview {
-                let mut clicked_idx = None;
-                for (idx, win) in inner.windows.iter().enumerate() {
-                    let (sx, sy, sw, sh) = win.slot_rect;
-                    if ex >= sx && ex <= sx + sw && ey >= sy && ey <= sy + sh {
-                        clicked_idx = Some(idx);
-                        break;
-                    }
-                }
-
-                if let Some(idx) = clicked_idx {
-                    if inner.target_mode == TargetMode::Window {
-                        let win = &inner.windows[idx];
-                        let win_xid = win.xid;
-                        let srect = win.screen_rect;
-
-                        if inner.action_mode == ActionMode::Record {
-                            drop(inner);
-                            ov_press.trigger_start_recording(Some(srect));
-                            return glib::Propagation::Stop;
-                        }
-
-                        let direct_img = win.live_image.clone().or_else(|| {
-                            X11CaptureEngine::capture_window(win_xid).ok()
-                        });
-
-                        if let Some(img) = direct_img {
-                            drop(inner);
-                            ov_press.confirm_direct_image(img, true, None);
-                            return glib::Propagation::Stop;
-                        } else {
-                            inner.crop = Some(srect);
-                            drop(inner);
-                            ov_press.confirm_screenshot(true, None);
-                            return glib::Propagation::Stop;
-                        }
-                    } else if inner.target_mode == TargetMode::WindowRegion {
-                        let slot = inner.windows[idx].slot_rect;
-                        let srect = inner.windows[idx].screen_rect;
-                        let target_rect = (
-                            srect.x as f64,
-                            srect.y as f64,
-                            srect.width as f64,
-                            srect.height as f64,
-                        );
-                        inner.zoom_animation = Some(ZoomAnimation {
-                            start_time: std::time::Instant::now(),
-                            duration: std::time::Duration::from_millis(220),
-                            from_rect: slot,
-                            to_rect: target_rect,
-                            window_idx: idx,
-                        });
-                        drop(inner);
-
-                        let inner_anim = ov_press.inner.clone();
-                        let da_anim = da_press.clone();
-                        glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
-                            let mut in_ref = inner_anim.borrow_mut();
-                            if let Some(ref anim) = in_ref.zoom_animation {
-                                let elapsed = anim.start_time.elapsed().as_secs_f64() / anim.duration.as_secs_f64();
-                                if elapsed >= 1.0 {
-                                    let win_idx = anim.window_idx;
-                                    let srect = in_ref.windows.get(win_idx).map(|w| w.screen_rect);
-                                    in_ref.zoom_animation = None;
-                                    in_ref.window_region_selected = Some(win_idx);
-                                    if let Some(sr) = srect {
-                                        in_ref.crop = Some(sr);
-                                    }
-                                    da_anim.queue_draw();
-                                    return glib::ControlFlow::Break;
-                                }
-                            } else {
-                                return glib::ControlFlow::Break;
-                            }
-                            da_anim.queue_draw();
-                            glib::ControlFlow::Continue
-                        });
-
-                        return glib::Propagation::Stop;
-                    }
-                }
-                return glib::Propagation::Proceed;
-            }
-
-            if inner.target_mode == TargetMode::Fullscreen {
-                return glib::Propagation::Proceed;
-            }
-
-            let handle = if let Some(r) = inner.crop {
-                Self::detect_handle(r, ex, ey)
-            } else {
-                DragHandle::New
-            };
-
-            Self::update_cursor(_da, handle);
-
-            inner.drag_handle = handle;
-            inner.drag_start = (ex, ey);
-            inner.initial_crop = inner.crop;
-
-            if handle == DragHandle::New {
-                inner.crop = Some(Rect::new(ex as i32, ey as i32, 0, 0));
-                inner.initial_crop = inner.crop;
-            }
-
-            da_press.queue_draw();
-            glib::Propagation::Proceed
-        });
-
-        let ov_motion = overlay.clone();
-        let da_motion = overlay.drawing_area.clone();
-        overlay.drawing_area.connect_motion_notify_event(move |_da, ev| {
-            let (ex, ey) = ev.position();
-            let mut inner = ov_motion.inner.borrow_mut();
-            inner.mouse_pos = (ex, ey);
-
-            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
-                && inner.window_region_selected.is_none()
-                && inner.zoom_animation.is_none();
-
-            if is_overview {
-                let mut hovered = None;
-                for (idx, win) in inner.windows.iter().enumerate() {
-                    let (sx, sy, sw, sh) = win.slot_rect;
-                    if ex >= sx && ex <= sx + sw && ey >= sy && ey <= sy + sh {
-                        hovered = Some(idx);
-                        break;
-                    }
-                }
-
-                if inner.hovered_window != hovered {
-                    inner.hovered_window = hovered;
-                    da_motion.queue_draw();
-                }
-
-                if hovered.is_some() {
-                    if let Some(gdk_win) = _da.window() {
-                        let display = gdk_win.display();
-                        let cursor = gdk::Cursor::from_name(&display, "pointer")
-                            .or_else(|| gdk::Cursor::for_display(&display, gdk::CursorType::Hand2));
-                        gdk_win.set_cursor(cursor.as_ref());
-                    }
-                } else {
-                    if let Some(gdk_win) = _da.window() {
-                        gdk_win.set_cursor(None);
-                    }
-                }
-                return glib::Propagation::Proceed;
-            }
-
-            let active_handle = if inner.drag_handle != DragHandle::None {
-                inner.drag_handle
-            } else if let Some(r) = inner.crop {
-                Self::detect_handle(r, ex, ey)
-            } else {
-                DragHandle::New
-            };
-            Self::update_cursor(_da, active_handle);
-
-            if inner.drag_handle != DragHandle::None {
-                let (sx, sy) = inner.drag_start;
-                let dx = ex - sx;
-                let dy = ey - sy;
-
-                let bounds = if let Some(widx) = inner.window_region_selected {
-                    inner.windows.get(widx).map(|w| w.screen_rect)
-                } else {
-                    None
-                };
-
-                if inner.drag_handle == DragHandle::New {
-                    let mut x1 = sx.min(ex);
-                    let mut y1 = sy.min(ey);
-                    let mut x2 = sx.max(ex);
-                    let mut y2 = sy.max(ey);
-
-                    if let Some(b) = bounds {
-                        x1 = x1.clamp(b.x as f64, (b.x + b.width as i32) as f64);
-                        y1 = y1.clamp(b.y as f64, (b.y + b.height as i32) as f64);
-                        x2 = x2.clamp(b.x as f64, (b.x + b.width as i32) as f64);
-                        y2 = y2.clamp(b.y as f64, (b.y + b.height as i32) as f64);
-                    }
-
-                    inner.crop = Some(Rect::new(
-                        x1 as i32,
-                        y1 as i32,
-                        (x2 - x1).max(0.0) as u32,
-                        (y2 - y1).max(0.0) as u32,
-                    ));
-                } else if inner.drag_handle == DragHandle::Move {
-                    if let Some(init) = inner.initial_crop {
-                        let (min_x, max_x, min_y, max_y) = if let Some(b) = bounds {
-                            (b.x, b.x + b.width as i32 - init.width as i32, b.y, b.y + b.height as i32 - init.height as i32)
-                        } else {
-                            let win_w = _da.allocated_width();
-                            let win_h = _da.allocated_height();
-                            (0, (win_w - init.width as i32).max(0), 0, (win_h - init.height as i32).max(0))
-                        };
-                        let nx = (init.x + dx as i32).clamp(min_x, max_x.max(min_x));
-                        let ny = (init.y + dy as i32).clamp(min_y, max_y.max(min_y));
-                        inner.crop = Some(Rect::new(nx, ny, init.width, init.height));
-                    }
-                } else if let Some(init) = inner.initial_crop {
-                    let mut x = init.x;
-                    let mut y = init.y;
-                    let mut w = init.width as i32;
-                    let mut h = init.height as i32;
-
-                    match inner.drag_handle {
-                        DragHandle::Nw => {
-                            x = (init.x + dx as i32).min(init.x + w - 10);
-                            y = (init.y + dy as i32).min(init.y + h - 10);
-                            w = (init.x + w) - x;
-                            h = (init.y + h) - y;
-                        }
-                        DragHandle::N => {
-                            y = (init.y + dy as i32).min(init.y + h - 10);
-                            h = (init.y + h) - y;
-                        }
-                        DragHandle::Ne => {
-                            y = (init.y + dy as i32).min(init.y + h - 10);
-                            w = (init.width as i32 + dx as i32).max(10);
-                            h = (init.y + h) - y;
-                        }
-                        DragHandle::E => {
-                            w = (init.width as i32 + dx as i32).max(10);
-                        }
-                        DragHandle::Se => {
-                            w = (init.width as i32 + dx as i32).max(10);
-                            h = (init.height as i32 + dy as i32).max(10);
-                        }
-                        DragHandle::S => {
-                            h = (init.height as i32 + dy as i32).max(10);
-                        }
-                        DragHandle::Sw => {
-                            x = (init.x + dx as i32).min(init.x + w - 10);
-                            w = (init.x + w) - x;
-                            h = (init.height as i32 + dy as i32).max(10);
-                        }
-                        DragHandle::W => {
-                            x = (init.x + dx as i32).min(init.x + w - 10);
-                            w = (init.x + w) - x;
-                        }
-                        _ => {}
-                    }
-
-                    if let Some(b) = bounds {
-                        x = x.clamp(b.x, b.x + b.width as i32 - 10);
-                        y = y.clamp(b.y, b.y + b.height as i32 - 10);
-                        w = w.min(b.x + b.width as i32 - x);
-                        h = h.min(b.y + b.height as i32 - y);
-                    }
-
-                    inner.crop = Some(Rect::new(x.max(0), y.max(0), w.max(1) as u32, h.max(1) as u32));
-                }
-
-                da_motion.queue_draw();
-            }
-
-            glib::Propagation::Proceed
-        });
-
-        let ov_release = overlay.clone();
-        let da_release = overlay.drawing_area.clone();
-        overlay.drawing_area.connect_button_release_event(move |_da, ev| {
-            let (ex, ey) = ev.position();
-            let mut inner = ov_release.inner.borrow_mut();
-            inner.drag_handle = DragHandle::None;
-            inner.initial_crop = None;
-
-            let is_overview = (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
-                && inner.window_region_selected.is_none()
-                && inner.zoom_animation.is_none();
-
-            if is_overview {
-                return glib::Propagation::Proceed;
-            }
-
-            let handle = if let Some(r) = inner.crop {
-                Self::detect_handle(r, ex, ey)
-            } else {
-                DragHandle::New
-            };
-            Self::update_cursor(_da, handle);
-
-            da_release.queue_draw();
-            glib::Propagation::Proceed
-        });
-
-        overlay.drawing_area.connect_leave_notify_event(move |_da, _ev| {
-            if let Some(gdk_win) = _da.window() {
-                gdk_win.set_cursor(None);
-            }
-            glib::Propagation::Proceed
-        });
-
-        // Keyboard Shortcuts
-        let handle_key = {
-            let overlay_key = overlay.clone();
-            Rc::new(move |ev: &gdk::EventKey| -> glib::Propagation {
-                match ev.keyval() {
-                    gdk::keys::constants::Escape => {
-                        let is_zoomed = overlay_key.inner.borrow().window_region_selected.is_some();
-                        if is_zoomed {
-                            let mut in_ref = overlay_key.inner.borrow_mut();
-                            in_ref.window_region_selected = None;
-                            in_ref.crop = None;
-                            drop(in_ref);
-                            overlay_key.drawing_area.queue_draw();
-                        } else {
-                            overlay_key.cancel();
-                        }
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::Print => {
-                        overlay_key.show_freeze();
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::Return | gdk::keys::constants::KP_Enter => {
-                        let mode = overlay_key.inner.borrow().action_mode;
-                        if mode == ActionMode::Screenshot {
-                            overlay_key.confirm_screenshot(true, None);
-                        } else {
-                            let crop = overlay_key.get_actual_crop();
-                            overlay_key.trigger_start_recording(crop);
-                        }
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::c | gdk::keys::constants::C
-                        if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
-                    {
-                        let mode = overlay_key.inner.borrow().action_mode;
-                        if mode == ActionMode::Screenshot {
-                            overlay_key.confirm_screenshot(true, None);
-                        }
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::s | gdk::keys::constants::S
-                        if ev.state().contains(gdk::ModifierType::CONTROL_MASK) =>
-                    {
-                        let mode = overlay_key.inner.borrow().action_mode;
-                        if mode == ActionMode::Screenshot {
-                            overlay_key.save_screenshot_as();
-                        }
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::_1 => {
-                        overlay_key.set_target_mode(TargetMode::Selection);
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::_2 => {
-                        overlay_key.set_target_mode(TargetMode::Window);
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::_3 => {
-                        overlay_key.set_target_mode(TargetMode::WindowRegion);
-                        glib::Propagation::Stop
-                    }
-                    gdk::keys::constants::_4 => {
-                        overlay_key.set_target_mode(TargetMode::Fullscreen);
-                        glib::Propagation::Stop
-                    }
-                    _ => glib::Propagation::Proceed,
-                }
-            })
-        };
-
-        let hk1 = handle_key.clone();
-        overlay.window.connect_key_press_event(move |_win, ev| hk1(ev));
-        let hk2 = handle_key;
-        overlay.drawing_area.connect_key_press_event(move |_da, ev| hk2(ev));
-
-        // Window Map / Unmap Hooks for Keyboard Grab
-        let ov_map = overlay.clone();
-        overlay.window.connect_map(move |_| {
-            ov_map.grab_keyboard();
-        });
-
-        let ov_unmap = overlay.clone();
-        overlay.window.connect_unmap(move |_| {
-            ov_unmap.ungrab_keyboard();
-        });
-
-        // Button Click Handlers
-        let ov_done = overlay.clone();
-        overlay.btn_done.connect_clicked(move |_| {
-            let mode = ov_done.inner.borrow().action_mode;
-            if mode == ActionMode::Screenshot {
-                ov_done.confirm_screenshot(true, None);
-            } else {
-                let crop = ov_done.get_actual_crop();
-                ov_done.trigger_start_recording(crop);
-            }
-        });
-
-        let ov_save_as = overlay.clone();
-        overlay.btn_save_as.connect_clicked(move |_| {
-            ov_save_as.save_screenshot_as();
-        });
-
-        let ov_rec = overlay.clone();
-        overlay.btn_record_action.connect_clicked(move |_| {
-            let crop = ov_rec.get_actual_crop();
-            ov_rec.trigger_start_recording(crop);
-        });
-
-        let ov_mode_shot = overlay.clone();
-        overlay.btn_mode_screenshot.connect_clicked(move |_| {
-            ov_mode_shot.set_action_mode(ActionMode::Screenshot);
-        });
-
-        let ov_mode_rec = overlay.clone();
-        overlay.btn_mode_record.connect_clicked(move |_| {
-            ov_mode_rec.set_action_mode(ActionMode::Record);
-        });
-
-        let ov_tgt_sel = overlay.clone();
-        overlay.btn_tgt_selection.connect_clicked(move |_| {
-            ov_tgt_sel.set_target_mode(TargetMode::Selection);
-        });
-
-        let ov_tgt_win = overlay.clone();
-        overlay.btn_tgt_window.connect_clicked(move |_| {
-            ov_tgt_win.set_target_mode(TargetMode::Window);
-        });
-
-        let ov_tgt_winreg = overlay.clone();
-        overlay.btn_tgt_window_region.connect_clicked(move |_| {
-            ov_tgt_winreg.set_target_mode(TargetMode::WindowRegion);
-        });
-
-        let ov_tgt_full = overlay.clone();
-        overlay.btn_tgt_fullscreen.connect_clicked(move |_| {
-            ov_tgt_full.set_target_mode(TargetMode::Fullscreen);
-        });
-
-        let ov_mic = overlay.clone();
-        overlay.btn_mic.connect_clicked(move |_| {
-            let mut inner = ov_mic.inner.borrow_mut();
-            inner.mic_enabled = !inner.mic_enabled;
-            ov_mic.btn_mic.set_label(if inner.mic_enabled { "Mic: ON" } else { "Mic: OFF" });
-            if inner.mic_enabled {
-                ov_mic.btn_mic.style_context().add_class("active");
-            } else {
-                ov_mic.btn_mic.style_context().remove_class("active");
-            }
-        });
-
-        let ov_audio = overlay.clone();
-        overlay.btn_desktop_audio.connect_clicked(move |_| {
-            let mut inner = ov_audio.inner.borrow_mut();
-            inner.desktop_audio_enabled = !inner.desktop_audio_enabled;
-            ov_audio.btn_desktop_audio.set_label(if inner.desktop_audio_enabled { "Audio: ON" } else { "Audio: OFF" });
-            if inner.desktop_audio_enabled {
-                ov_audio.btn_desktop_audio.style_context().add_class("active");
-            } else {
-                ov_audio.btn_desktop_audio.style_context().remove_class("active");
-            }
-        });
-
-        let ov_cancel = overlay.clone();
-        btn_cancel.connect_clicked(move |_| {
-            ov_cancel.cancel();
-        });
-
-        let ov_settings = overlay.clone();
-        btn_settings.connect_clicked(move |_| {
-            ov_settings.cancel();
-            on_open_settings();
-        });
-
-        // Periodic background refresh for Overview mode (shows windows live)
-        let ov_poll = overlay.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
-            if !ov_poll.window.is_visible() {
-                return glib::ControlFlow::Continue;
-            }
-
-            let should_refresh = {
-                let inner = ov_poll.inner.borrow();
-                (inner.target_mode == TargetMode::Window || inner.target_mode == TargetMode::WindowRegion)
-                    && inner.window_region_selected.is_none()
-                    && inner.zoom_animation.is_none()
-            };
-
-            if should_refresh {
-                ov_poll.refresh_overview_windows();
-            }
-
-            glib::ControlFlow::Continue
-        });
-
-        overlay
+        let _ = backend.present_surface_bgra(
+            WindowRole::OverlayFullscreen,
+            self.canvas.width,
+            self.canvas.height,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
+        backend.grab_overlay_keyboard();
+        self.update_cursor(backend, -1.0, -1.0);
     }
 
-    fn detect_handle(r: Rect, x: f64, y: f64) -> DragHandle {
-        let rx = r.x as f64;
-        let ry = r.y as f64;
-        let rw = r.width as f64;
-        let rh = r.height as f64;
-        let r_bound = (rw.min(rh) / 2.0).clamp(6.0, 14.0);
-
-        let dist = |hx: f64, hy: f64| -> f64 {
-            let dx = x - hx;
-            let dy = y - hy;
-            (dx * dx + dy * dy).sqrt()
-        };
-
-        // Prioritize corners so picking corner handles is immediate and responsive
-        if dist(rx, ry) <= r_bound {
-            DragHandle::Nw
-        } else if dist(rx + rw, ry) <= r_bound {
-            DragHandle::Ne
-        } else if dist(rx + rw, ry + rh) <= r_bound {
-            DragHandle::Se
-        } else if dist(rx, ry + rh) <= r_bound {
-            DragHandle::Sw
-        } else if dist(rx + rw / 2.0, ry) <= r_bound {
-            DragHandle::N
-        } else if dist(rx + rw, ry + rh / 2.0) <= r_bound {
-            DragHandle::E
-        } else if dist(rx + rw / 2.0, ry + rh) <= r_bound {
-            DragHandle::S
-        } else if dist(rx, ry + rh / 2.0) <= r_bound {
-            DragHandle::W
-        } else if x >= rx && x <= rx + rw && y >= ry && y <= ry + rh {
-            DragHandle::Move
-        } else {
-            DragHandle::New
+    pub fn hide(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
         }
+        self.visible = false;
+        self.action_mode = ActionMode::Screenshot;
+        self.drag_anchor = None;
+        self.zoom_start = None;
+        self.zoomed_card = None;
+        self.zoom_selection = None;
+        self.desktop = None;
+        self.cards.clear();
+        self.last_cursor = None;
+        backend.ungrab_overlay_keyboard();
+        backend.hide_surface(WindowRole::OverlayFullscreen);
     }
 
-    fn update_cursor(da: &gtk::DrawingArea, handle: DragHandle) {
-        if let Some(gdk_win) = da.window() {
-            let cursor_name = match handle {
-                DragHandle::Nw
-                | DragHandle::Ne
-                | DragHandle::Se
-                | DragHandle::Sw
-                | DragHandle::N
-                | DragHandle::S
-                | DragHandle::E
-                | DragHandle::W => "pointer",
-                DragHandle::Move => "move",
-                DragHandle::New => "crosshair",
-                DragHandle::None => "default",
-            };
-            let display = gdk_win.display();
-            let cursor = gdk::Cursor::from_name(&display, cursor_name).or_else(|| match cursor_name {
-                "pointer" => gdk::Cursor::for_display(&display, gdk::CursorType::Hand2),
-                "move" => gdk::Cursor::for_display(&display, gdk::CursorType::Fleur),
-                "crosshair" => gdk::Cursor::for_display(&display, gdk::CursorType::Crosshair),
-                _ => None,
-            });
-            gdk_win.set_cursor(cursor.as_ref());
+    pub fn on_expose(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
         }
+        let _ = backend.present_surface_bgra(
+            WindowRole::OverlayFullscreen,
+            self.canvas.width,
+            self.canvas.height,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
     }
 
-    pub fn set_action_mode(&self, mode: ActionMode) {
-        self.inner.borrow_mut().action_mode = mode;
-        if mode == ActionMode::Screenshot {
-            self.btn_mode_screenshot.style_context().add_class("active");
-            self.btn_mode_record.style_context().remove_class("active");
-            self.btn_done.show();
-            self.btn_save_as.show();
-            self.btn_record_action.hide();
-            self.audio_box.hide();
-        } else {
-            self.btn_mode_screenshot.style_context().remove_class("active");
-            self.btn_mode_record.style_context().add_class("active");
-            self.btn_done.hide();
-            self.btn_save_as.hide();
-            self.btn_record_action.show();
-            self.audio_box.show();
+    pub fn on_window_damaged(&mut self, backend: &mut dyn DisplayBackend, window_id: u64) {
+        if !self.visible {
+            return;
         }
-        self.drawing_area.queue_draw();
-    }
-
-    pub fn set_target_mode(&self, target: TargetMode) {
-        let mut inner = self.inner.borrow_mut();
-        inner.target_mode = target;
-        inner.zoom_animation = None;
-        inner.window_region_selected = None;
-        self.btn_tgt_selection.style_context().remove_class("active");
-        self.btn_tgt_window.style_context().remove_class("active");
-        self.btn_tgt_window_region.style_context().remove_class("active");
-        self.btn_tgt_fullscreen.style_context().remove_class("active");
-
-        match target {
-            TargetMode::Selection => {
-                self.btn_tgt_selection.style_context().add_class("active");
-            }
-            TargetMode::Window => {
-                self.btn_tgt_window.style_context().add_class("active");
-            }
-            TargetMode::WindowRegion => {
-                self.btn_tgt_window_region.style_context().add_class("active");
-            }
-            TargetMode::Fullscreen => {
-                self.btn_tgt_fullscreen.style_context().add_class("active");
-            }
+        let show_overview = matches!(
+            self.target_mode,
+            TargetMode::Window | TargetMode::WindowRegion
+        );
+        if !show_overview {
+            return;
         }
-        drop(inner);
-
-        if target == TargetMode::Window || target == TargetMode::WindowRegion {
-            self.refresh_overview_windows();
-        }
-
-        self.drawing_area.queue_draw();
-    }
-
-    pub fn refresh_overview_windows(&self) {
-        let (screen_w, screen_h, root_pb, mouse_pos) = {
-            let inner = self.inner.borrow();
-            let (w, h) = inner.image.as_ref().map(|i| (i.width() as f64, i.height() as f64)).unwrap_or((1920.0, 1080.0));
-            (w, h, inner.pixbuf.clone(), inner.mouse_pos)
-        };
-
-        let win_infos = X11CaptureEngine::enumerate_client_windows();
-        let new_windows = build_overview_windows(win_infos, screen_w, screen_h, root_pb.as_ref());
-
-        let (mx, my) = mouse_pos;
-        let mut hovered = None;
-        for (idx, win) in new_windows.iter().enumerate() {
-            let (sx, sy, sw, sh) = win.slot_rect;
-            if mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh {
-                hovered = Some(idx);
-                break;
-            }
-        }
-
-        let mut inner = self.inner.borrow_mut();
-        inner.windows = new_windows;
-        inner.hovered_window = hovered;
-        drop(inner);
-        self.drawing_area.queue_draw();
-    }
-
-    pub fn get_actual_crop(&self) -> Option<Rect> {
-        let inner = self.inner.borrow();
-        if inner.target_mode == TargetMode::Fullscreen {
-            return None;
-        }
-        if inner.target_mode == TargetMode::Window {
-            if let Some(idx) = inner.hovered_window {
-                if let Some(win) = inner.windows.get(idx) {
-                    return Some(win.screen_rect);
-                }
-            } else if inner.windows.len() == 1 {
-                return inner.windows.first().map(|w| w.screen_rect);
-            }
-        }
-        inner.crop
-    }
-
-    pub fn trigger_start_recording(&self, crop: Option<Rect>) {
-        let mic = self.inner.borrow().mic_enabled;
-        let audio = self.inner.borrow().desktop_audio_enabled;
-        self.cancel();
-        (self.on_start_recording)(crop, mic, audio);
-    }
-
-    pub fn cancel(&self) {
-        self.ungrab_keyboard();
-        self.window.hide();
-        let mut inner = self.inner.borrow_mut();
-        inner.crop = None;
-        inner.image = None;
-        inner.pixbuf = None;
-        inner.windows.clear();
-        inner.hovered_window = None;
-        inner.zoom_animation = None;
-        inner.window_region_selected = None;
-        inner.action_mode = ActionMode::Screenshot;
-    }
-
-    pub fn confirm_direct_image(
-        &self,
-        image: ImageBuffer<Rgba<u8>, Vec<u8>>,
-        copy_to_clipboard: bool,
-        custom_path: Option<std::path::PathBuf>,
-    ) {
-        self.cancel();
-        self.finalize_captured_image(image, copy_to_clipboard, custom_path);
-    }
-
-    fn finalize_captured_image(
-        &self,
-        image: ImageBuffer<Rgba<u8>, Vec<u8>>,
-        copy_to_clipboard: bool,
-        custom_path: Option<std::path::PathBuf>,
-    ) {
-        if copy_to_clipboard {
-            let (w, h) = image.dimensions();
-            let raw = image.clone().into_raw();
-            let bytes = glib::Bytes::from(&raw);
-            let pb = gdk_pixbuf::Pixbuf::from_bytes(
-                &bytes,
-                gdk_pixbuf::Colorspace::Rgb,
-                true,
-                8,
-                w as i32,
-                h as i32,
-                (w * 4) as i32,
-            );
-            let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
-            clipboard.set_image(&pb);
-            clipboard.store();
-
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let _ = cb.set_image(arboard::ImageData {
-                    width: w as usize,
-                    height: h as usize,
-                    bytes: std::borrow::Cow::Borrowed(&raw),
-                });
-            }
-        }
-
-        let cfg = self.app_state.get_config();
-        let out_path = custom_path.unwrap_or_else(|| {
-            let dir = expand_path(&cfg.storage.screenshot_dir);
-            let _ = std::fs::create_dir_all(&dir);
-            let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-            ensure_unique_path(dir.join(format!("Vexrec_{}.png", now)))
-        });
-
-        if let Some(parent) = out_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        if let Ok(()) = SnapshotEngine::save_image(&image, &out_path) {
-            crate::commands::notify_with_open_action(
-                "camera-photo",
-                "Screenshot Captured",
-                &format!("Saved to {}", out_path.display()),
-                &out_path,
-            );
-        }
-    }
-
-    pub fn confirm_screenshot(&self, copy_to_clipboard: bool, custom_path: Option<std::path::PathBuf>) {
-        let (img, crop, target_mode, hovered_idx, selected_window) = {
-            let inner = self.inner.borrow();
-            let sel_win = inner.window_region_selected.and_then(|idx| inner.windows.get(idx).cloned());
-            (
-                inner.image.clone(),
-                inner.crop,
-                inner.target_mode,
-                inner.hovered_window,
-                sel_win,
-            )
-        };
-
-        if target_mode == TargetMode::Window && selected_window.is_none() {
-            let target_win = hovered_idx
-                .and_then(|idx| self.inner.borrow().windows.get(idx).cloned())
-                .or_else(|| {
-                    let in_ref = self.inner.borrow();
-                    if in_ref.windows.len() == 1 {
-                        in_ref.windows.first().cloned()
-                    } else {
-                        None
+        if let Ok(fresh) = backend.capture_window(window_id) {
+            if let Some(zoom_idx) = self.zoomed_card {
+                if let Some(card) = self.cards.get_mut(zoom_idx) {
+                    if card.window.id == window_id {
+                        card.window.preview = Some(fresh);
+                        self.present_dirty(backend, Some(self.zoom_to.outset(8)));
+                        return;
                     }
-                });
-
-            if let Some(win) = target_win {
-                let direct_img = win.live_image.clone().or_else(|| {
-                    X11CaptureEngine::capture_window(win.xid).ok()
-                });
-                if let Some(img) = direct_img {
-                    self.cancel();
-                    self.finalize_captured_image(img, copy_to_clipboard, custom_path);
+                }
+            }
+            for card in &mut self.cards {
+                if card.window.id == window_id {
+                    let dirty = card.card_rect.outset(8);
+                    card.window.preview = Some(fresh);
+                    self.present_dirty(backend, Some(dirty));
                     return;
                 }
             }
         }
+    }
 
-        self.cancel();
+    pub fn tick(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible || self.zoom_start.is_none() {
+            return;
+        }
+        let done = self
+            .zoom_start
+            .map(|s| s.elapsed() >= Duration::from_millis(ZOOM_DURATION_MS))
+            .unwrap_or(true);
+        self.present_dirty(backend, None);
+        if done {
+            self.zoom_start = None;
+        }
+    }
 
-        let final_image = if let Some(ref win) = selected_window {
-            if let Some(ref win_img) = win.live_image {
-                if let Some(r) = crop {
-                    let (win_w, win_h) = win_img.dimensions();
-                    let rel_x = (r.x - win.screen_rect.x).max(0) as u32;
-                    let rel_y = (r.y - win.screen_rect.y).max(0) as u32;
-                    let rx = rel_x.min(win_w.saturating_sub(1));
-                    let ry = rel_y.min(win_h.saturating_sub(1));
-                    let rw = r.width.min(win_w.saturating_sub(rx));
-                    let rh = r.height.min(win_h.saturating_sub(ry));
-                    if rw > 0 && rh > 0 {
-                        Some(image::imageops::crop_imm(win_img, rx, ry, rw, rh).to_image())
-                    } else {
-                        Some(win_img.clone())
-                    }
-                } else {
-                    Some(win_img.clone())
+    pub fn on_key(&mut self, backend: &mut dyn DisplayBackend, key: KeyAction) -> OverlayOutcome {
+        if !self.visible {
+            return OverlayOutcome::None;
+        }
+        match key {
+            KeyAction::Escape => {
+                if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                    self.zoomed_card = None;
+                    self.zoom_start = None;
+                    self.zoom_selection = None;
+                    self.drag_anchor = None;
+                    self.present_dirty(backend, None);
+                    return OverlayOutcome::None;
                 }
-            } else {
-                None
+                OverlayOutcome::Cancel
             }
+            KeyAction::Print => OverlayOutcome::RefreshCapture,
+            KeyAction::Return => self.trigger_primary_action(false),
+            KeyAction::CtrlC => self.trigger_primary_action(false),
+            KeyAction::CtrlS => {
+                if self.action_mode == ActionMode::Screenshot {
+                    self.trigger_primary_action(true)
+                } else {
+                    OverlayOutcome::None
+                }
+            }
+            KeyAction::Num(n) => {
+                let next = match n {
+                    1 => TargetMode::Selection,
+                    2 => TargetMode::Window,
+                    3 => TargetMode::WindowRegion,
+                    4 => TargetMode::Fullscreen,
+                    _ => return OverlayOutcome::None,
+                };
+                if next != self.target_mode {
+                    self.switch_target_mode(backend, next);
+                }
+                OverlayOutcome::None
+            }
+            _ => OverlayOutcome::None,
+        }
+    }
+
+    pub fn on_pointer_motion(&mut self, backend: &mut dyn DisplayBackend, x: f64, y: f64) {
+        if !self.visible {
+            return;
+        }
+
+        if let Some(ref anchor) = self.drag_anchor {
+            let bounds = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                self.zoom_to
+            } else {
+                Rect::new(0, 0, self.screen_w, self.screen_h)
+            };
+            let new_rect = apply_drag_delta(anchor, x, y, bounds);
+
+            let old_opt = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                let prev = self.zoom_selection.replace(new_rect);
+                prev
+            } else {
+                let prev = self.selection.replace(new_rect);
+                prev
+            };
+
+            let dirty = match old_opt {
+                Some(old) => old.union(new_rect).outset(64),
+                None => new_rect.outset(64),
+            };
+            self.present_dirty(backend, Some(dirty));
+            self.update_cursor(backend, x, y);
+            return;
+        }
+
+        let old_btn = self.hovered_btn;
+        let old_card = self.hovered_card;
+        let px = x.round() as i32;
+        let py = y.round() as i32;
+
+        self.hovered_btn = self
+            .pill_buttons
+            .iter()
+            .find(|b| b.rect.contains(Point::new(px, py)))
+            .map(|b| b.id);
+
+        self.hovered_card = if self.hovered_btn.is_none()
+            && ((self.target_mode == TargetMode::Window)
+                || (self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_none()))
+        {
+            self.cards
+                .iter()
+                .find(|c| c.card_rect.contains(Point::new(px, py)))
+                .map(|c| c.index)
         } else {
             None
         };
 
-        let image_to_save = final_image.or_else(|| {
-            img.map(|mut image| {
-                if let Some(r) = crop {
-                    let (w, h) = image.dimensions();
-                    let rx = (r.x.max(0) as u32).min(w.saturating_sub(1));
-                    let ry = (r.y.max(0) as u32).min(h.saturating_sub(1));
-                    let rw = r.width.min(w.saturating_sub(rx));
-                    let rh = r.height.min(h.saturating_sub(ry));
-                    if rw > 0 && rh > 0 {
-                        image = image::imageops::crop_imm(&image, rx, ry, rw, rh).to_image();
+        if old_btn != self.hovered_btn {
+            self.present_dirty(backend, Some(self.pill_rect.outset(16)));
+        }
+        if old_card != self.hovered_card {
+            let mut dirty = None;
+            if let Some(i) = old_card {
+                if let Some(c) = self.cards.get(i) {
+                    dirty = Some(c.card_rect.outset(12));
+                }
+            }
+            if let Some(i) = self.hovered_card {
+                if let Some(c) = self.cards.get(i) {
+                    let r = c.card_rect.outset(12);
+                    dirty = Some(match dirty {
+                        Some(d) => d.union(r),
+                        None => r,
+                    });
+                }
+            }
+            if let Some(d) = dirty {
+                self.present_dirty(backend, Some(d));
+            }
+        }
+
+        self.update_cursor(backend, x, y);
+    }
+
+    pub fn on_pointer_button(
+        &mut self,
+        backend: &mut dyn DisplayBackend,
+        button: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+    ) -> OverlayOutcome {
+        if !self.visible {
+            return OverlayOutcome::None;
+        }
+        if button != 1 {
+            if button == 3 && !pressed {
+                return OverlayOutcome::Cancel;
+            }
+            return OverlayOutcome::None;
+        }
+
+        let px = x.round() as i32;
+        let py = y.round() as i32;
+
+        if pressed {
+            // Check pill clicks first
+            if let Some(btn) = self
+                .pill_buttons
+                .iter()
+                .find(|b| b.rect.contains(Point::new(px, py)))
+                .map(|b| b.id)
+            {
+                return self.handle_pill_click(backend, btn);
+            }
+
+            // Overview mosaic clicks
+            if self.target_mode == TargetMode::Window {
+                if let Some(card_idx) = self
+                    .cards
+                    .iter()
+                    .find(|c| c.card_rect.contains(Point::new(px, py)))
+                    .map(|c| c.index)
+                {
+                    return self.trigger_window_action(card_idx);
+                }
+                return OverlayOutcome::None;
+            }
+
+            if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_none() {
+                if let Some(card_idx) = self
+                    .cards
+                    .iter()
+                    .find(|c| c.card_rect.contains(Point::new(px, py)))
+                    .map(|c| c.index)
+                {
+                    let card = &self.cards[card_idx];
+                    let src_w = card
+                        .window
+                        .preview
+                        .as_ref()
+                        .map(|p| p.width)
+                        .unwrap_or(card.window.rect.width);
+                    let src_h = card
+                        .window
+                        .preview
+                        .as_ref()
+                        .map(|p| p.height)
+                        .unwrap_or(card.window.rect.height);
+                    self.zoom_from = card.thumb_rect;
+                    self.zoom_to = compute_zoom_target_rect(src_w, src_h, self.screen_w, self.screen_h);
+                    self.zoom_start = Some(Instant::now());
+                    self.zoomed_card = Some(card_idx);
+                    self.zoom_selection = None;
+                    self.hovered_card = None;
+                    self.present_dirty(backend, None);
+                    self.update_cursor(backend, x, y);
+                }
+                return OverlayOutcome::None;
+            }
+
+            if self.target_mode == TargetMode::Fullscreen {
+                return OverlayOutcome::None;
+            }
+
+            // Selection / Zoomed Window Region drag start
+            let active_opt = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                self.zoom_selection
+            } else {
+                self.selection
+            };
+            let bounds = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                self.zoom_to
+            } else {
+                Rect::new(0, 0, self.screen_w, self.screen_h)
+            };
+
+            let handle = match active_opt {
+                Some(r) => hit_test_selection_handle(r, x, y),
+                None => DragHandle::None,
+            };
+
+            if handle != DragHandle::None {
+                self.drag_anchor = Some(SelectionAnchor {
+                    handle,
+                    start_pointer: Point::new(px, py),
+                    orig_rect: active_opt.unwrap_or_default(),
+                });
+            } else if bounds.contains(Point::new(px, py)) {
+                let start_r = Rect::new(px, py, 1, 1);
+                if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                    let prev = self.zoom_selection.replace(start_r);
+                    self.drag_anchor = Some(SelectionAnchor {
+                        handle: DragHandle::Creating,
+                        start_pointer: Point::new(px, py),
+                        orig_rect: start_r,
+                    });
+                    if let Some(p) = prev {
+                        self.present_dirty(backend, Some(p.outset(64)));
+                    }
+                } else {
+                    let prev = self.selection.replace(start_r);
+                    self.drag_anchor = Some(SelectionAnchor {
+                        handle: DragHandle::Creating,
+                        start_pointer: Point::new(px, py),
+                        orig_rect: start_r,
+                    });
+                    if let Some(p) = prev {
+                        self.present_dirty(backend, Some(p.outset(64)));
                     }
                 }
-                image
-            })
-        });
-
-        if let Some(image) = image_to_save {
-            self.finalize_captured_image(image, copy_to_clipboard, custom_path);
-        }
-    }
-
-    pub fn save_screenshot_as(&self) {
-        self.ungrab_keyboard();
-        let chooser = gtk::FileChooserNative::new(
-            Some("Save Screenshot As"),
-            Some(&self.window),
-            gtk::FileChooserAction::Save,
-            Some("Save"),
-            Some("Cancel"),
-        );
-        chooser.set_do_overwrite_confirmation(true);
-        let now = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-        chooser.set_current_name(&format!("Vexrec_{}.png", now));
-
-        if chooser.run() == gtk::ResponseType::Accept {
-            if let Some(chosen) = chooser.filename() {
-                self.confirm_screenshot(true, Some(chosen));
             }
-        } else if self.window.is_visible() {
-            self.grab_keyboard();
+            self.update_cursor(backend, x, y);
+            return OverlayOutcome::None;
+        }
+
+        // Release left mouse button
+        if let Some(anchor) = self.drag_anchor.take() {
+            if anchor.handle == DragHandle::Creating {
+                let active = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                    self.zoom_selection
+                } else {
+                    self.selection
+                };
+                if let Some(r) = active {
+                    if r.width < 6 || r.height < 6 {
+                        if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                            self.zoom_selection = None;
+                        } else {
+                            self.selection = None;
+                        }
+                        self.present_dirty(backend, Some(r.outset(64)));
+                    }
+                }
+            }
+            self.update_cursor(backend, x, y);
+        }
+        OverlayOutcome::None
+    }
+
+    fn switch_target_mode(&mut self, backend: &mut dyn DisplayBackend, next: TargetMode) {
+        self.target_mode = next;
+        self.drag_anchor = None;
+        self.zoomed_card = None;
+        self.zoom_start = None;
+        self.zoom_selection = None;
+        self.hovered_card = None;
+        self.layout_pill();
+        self.present_dirty(backend, None);
+    }
+
+    fn handle_pill_click(
+        &mut self,
+        backend: &mut dyn DisplayBackend,
+        btn: PillButtonId,
+    ) -> OverlayOutcome {
+        match btn {
+            PillButtonId::ModeScreenshot => {
+                if self.action_mode != ActionMode::Screenshot {
+                    self.action_mode = ActionMode::Screenshot;
+                    self.layout_pill();
+                    self.present_dirty(backend, None);
+                }
+            }
+            PillButtonId::ModeRecord => {
+                if self.action_mode != ActionMode::Record {
+                    self.action_mode = ActionMode::Record;
+                    self.layout_pill();
+                    self.present_dirty(backend, None);
+                }
+            }
+            PillButtonId::TargetSelection => self.switch_target_mode(backend, TargetMode::Selection),
+            PillButtonId::TargetWindow => self.switch_target_mode(backend, TargetMode::Window),
+            PillButtonId::TargetWindowRegion => {
+                self.switch_target_mode(backend, TargetMode::WindowRegion)
+            }
+            PillButtonId::TargetFullscreen => {
+                self.switch_target_mode(backend, TargetMode::Fullscreen)
+            }
+            PillButtonId::ToggleMic => {
+                self.mic_enabled = !self.mic_enabled;
+                self.layout_pill();
+                self.present_dirty(backend, Some(self.pill_rect.outset(16)));
+            }
+            PillButtonId::ToggleAudio => {
+                self.audio_enabled = !self.audio_enabled;
+                self.layout_pill();
+                self.present_dirty(backend, Some(self.pill_rect.outset(16)));
+            }
+            PillButtonId::DoneOrRecord => return self.trigger_primary_action(false),
+            PillButtonId::SaveAs => return self.trigger_primary_action(true),
+            PillButtonId::Settings => return OverlayOutcome::OpenSettings,
+            PillButtonId::Cancel => return OverlayOutcome::Cancel,
+        }
+        OverlayOutcome::None
+    }
+
+    fn trigger_window_action(&self, card_idx: usize) -> OverlayOutcome {
+        let Some(card) = self.cards.get(card_idx) else {
+            return OverlayOutcome::None;
+        };
+        let win_rect = card.window.rect.clamp_bounds(self.screen_w, self.screen_h);
+        match self.action_mode {
+            ActionMode::Record => {
+                if win_rect.width >= 16 && win_rect.height >= 16 {
+                    OverlayOutcome::StartRecording {
+                        crop: Some(win_rect),
+                        record_mic: self.mic_enabled,
+                        record_desktop: self.audio_enabled,
+                    }
+                } else {
+                    OverlayOutcome::None
+                }
+            }
+            ActionMode::Screenshot => {
+                if let Some(ref p) = card.window.preview {
+                    return OverlayOutcome::CaptureScreenshot {
+                        img: p.clone(),
+                        save_as: false,
+                    };
+                }
+                if let Some(ref desktop) = self.desktop {
+                    if let Some(cropped) = desktop.crop_rect(
+                        win_rect.x.max(0) as u32,
+                        win_rect.y.max(0) as u32,
+                        win_rect.width,
+                        win_rect.height,
+                    ) {
+                        return OverlayOutcome::CaptureScreenshot {
+                            img: cropped,
+                            save_as: false,
+                        };
+                    }
+                }
+                OverlayOutcome::None
+            }
         }
     }
 
-    pub fn try_grab_seat(&self) -> bool {
-        if let Some(display) = gdk::Display::default() {
-            if let Some(seat) = display.default_seat() {
-                if let Some(gdk_win) = self.window.window() {
-                    gdk_win.focus(0);
-                    let status = seat.grab(
-                        &gdk_win,
-                        gdk::SeatCapabilities::KEYBOARD,
-                        false,
-                        None,
-                        None,
-                        None,
-                    );
-                    return status == gdk::GrabStatus::Success;
+    fn trigger_primary_action(&self, save_as: bool) -> OverlayOutcome {
+        let Some(ref desktop) = self.desktop else {
+            return OverlayOutcome::None;
+        };
+
+        match self.target_mode {
+            TargetMode::Fullscreen => match self.action_mode {
+                ActionMode::Screenshot => OverlayOutcome::CaptureScreenshot {
+                    img: desktop.clone(),
+                    save_as,
+                },
+                ActionMode::Record => OverlayOutcome::StartRecording {
+                    crop: None,
+                    record_mic: self.mic_enabled,
+                    record_desktop: self.audio_enabled,
+                },
+            },
+            TargetMode::Selection => {
+                let r = self
+                    .selection
+                    .filter(|s| s.width >= 4 && s.height >= 4)
+                    .unwrap_or_else(|| Rect::new(0, 0, self.screen_w, self.screen_h));
+                match self.action_mode {
+                    ActionMode::Screenshot => {
+                        if let Some(img) = desktop.crop_rect(
+                            r.x.max(0) as u32,
+                            r.y.max(0) as u32,
+                            r.width,
+                            r.height,
+                        ) {
+                            OverlayOutcome::CaptureScreenshot { img, save_as }
+                        } else {
+                            OverlayOutcome::None
+                        }
+                    }
+                    ActionMode::Record => {
+                        let crop = if r.width == self.screen_w && r.height == self.screen_h {
+                            None
+                        } else {
+                            Some(r)
+                        };
+                        OverlayOutcome::StartRecording {
+                            crop,
+                            record_mic: self.mic_enabled,
+                            record_desktop: self.audio_enabled,
+                        }
+                    }
+                }
+            }
+            TargetMode::Window => {
+                let idx = self.hovered_card.or(if self.cards.is_empty() { None } else { Some(0) });
+                match idx {
+                    Some(i) => self.trigger_window_action(i),
+                    None => OverlayOutcome::None,
+                }
+            }
+            TargetMode::WindowRegion => {
+                let Some(idx) = self.zoomed_card else {
+                    return OverlayOutcome::None;
+                };
+                let Some(card) = self.cards.get(idx) else {
+                    return OverlayOutcome::None;
+                };
+                let src_w = card
+                    .window
+                    .preview
+                    .as_ref()
+                    .map(|p| p.width)
+                    .unwrap_or(card.window.rect.width)
+                    .max(1);
+                let src_h = card
+                    .window
+                    .preview
+                    .as_ref()
+                    .map(|p| p.height)
+                    .unwrap_or(card.window.rect.height)
+                    .max(1);
+                let local_crop = if let Some(zsel) = self.zoom_selection.filter(|r| r.width >= 4 && r.height >= 4) {
+                    let sx = src_w as f64 / self.zoom_to.width.max(1) as f64;
+                    let sy = src_h as f64 / self.zoom_to.height.max(1) as f64;
+                    let lx = ((zsel.x - self.zoom_to.x) as f64 * sx).round().max(0.0) as i32;
+                    let ly = ((zsel.y - self.zoom_to.y) as f64 * sy).round().max(0.0) as i32;
+                    let lw = (zsel.width as f64 * sx).round().clamp(4.0, src_w as f64) as u32;
+                    let lh = (zsel.height as f64 * sy).round().clamp(4.0, src_h as f64) as u32;
+                    Rect::new(lx, ly, lw, lh)
+                } else {
+                    Rect::new(0, 0, src_w, src_h)
+                };
+
+                match self.action_mode {
+                    ActionMode::Screenshot => {
+                        if let Some(img) = extract_window_crop_or_fallback(
+                            card.window.preview.as_ref(),
+                            desktop,
+                            card.window.rect,
+                            local_crop,
+                        ) {
+                            OverlayOutcome::CaptureScreenshot { img, save_as }
+                        } else {
+                            OverlayOutcome::None
+                        }
+                    }
+                    ActionMode::Record => {
+                        let abs_rect = Rect::new(
+                            card.window.rect.x + local_crop.x,
+                            card.window.rect.y + local_crop.y,
+                            local_crop.width,
+                            local_crop.height,
+                        )
+                        .clamp_bounds(self.screen_w, self.screen_h);
+                        OverlayOutcome::StartRecording {
+                            crop: Some(abs_rect),
+                            record_mic: self.mic_enabled,
+                            record_desktop: self.audio_enabled,
+                        }
+                    }
                 }
             }
         }
-        false
     }
 
-    pub fn grab_keyboard(&self) {
-        self.window.grab_focus();
-        self.drawing_area.grab_focus();
-        self.window.grab_add();
-        let _ = self.try_grab_seat();
-
-        // Retry seat grab in case window manager hotkey was still releasing
-        let retry = self.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
-            if retry.window.is_visible() {
-                if !retry.try_grab_seat() {
-                    return glib::ControlFlow::Continue;
-                }
-            }
-            glib::ControlFlow::Break
-        });
-    }
-
-    pub fn ungrab_keyboard(&self) {
-        self.window.grab_remove();
-        if let Some(display) = gdk::Display::default() {
-            if let Some(seat) = display.default_seat() {
-                seat.ungrab();
-            }
-        }
-    }
-
-    pub fn show_freeze(&self) {
-        // If already visible, unmap and wait for compositor repaint to avoid self-capture
-        if self.window.is_visible() {
-            self.ungrab_keyboard();
-            self.window.hide();
-            while gtk::events_pending() {
-                gtk::main_iteration();
-            }
-            if let Some(display) = gdk::Display::default() {
-                display.sync();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(60));
-        }
-
-        // Fast capture: Direct X11 or Portal
-        let img_res: Result<ImageBuffer<Rgba<u8>, Vec<u8>>, VexrecError> = if X11CaptureEngine::is_available() {
-            X11CaptureEngine::capture_screen(None)
-        } else {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(handle) = rt {
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        let portal = PortalClient::new();
-                        let uri = portal.request_screenshot(false).await.map_err(|e| VexrecError::Portal(e.to_string()))?;
-                        let p = uri.to_file_path().map_err(|_| VexrecError::Pipeline("Bad URI".to_string()))?;
-                        let loaded = image::open(&p).map_err(|e| VexrecError::Pipeline(e.to_string()))?.to_rgba8();
-                        let _ = std::fs::remove_file(&p);
-                        Ok(loaded)
-                    })
-                })
+    fn update_cursor(&mut self, backend: &mut dyn DisplayBackend, x: f64, y: f64) {
+        let next = if self.hovered_btn.is_some() {
+            CursorKind::Pointer
+        } else if (self.target_mode == TargetMode::Window)
+            || (self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_none())
+        {
+            if self.hovered_card.is_some() {
+                CursorKind::Pointer
             } else {
-                Err(VexrecError::Pipeline("Capture unavailable".into()))
+                CursorKind::Default
+            }
+        } else if self.target_mode == TargetMode::Fullscreen {
+            CursorKind::Default
+        } else if let Some(ref anchor) = self.drag_anchor {
+            match anchor.handle {
+                DragHandle::Body => CursorKind::Move,
+                DragHandle::Creating | DragHandle::None => CursorKind::Crosshair,
+                _ => CursorKind::Pointer,
+            }
+        } else {
+            let active = if self.target_mode == TargetMode::WindowRegion && self.zoomed_card.is_some() {
+                self.zoom_selection
+            } else {
+                self.selection
+            };
+            match active {
+                Some(r) => match hit_test_selection_handle(r, x, y) {
+                    DragHandle::Body => CursorKind::Move,
+                    DragHandle::None => CursorKind::Crosshair,
+                    // Corner and edge handles strictly use Pointer per design spec
+                    _ => CursorKind::Pointer,
+                },
+                None => CursorKind::Crosshair,
             }
         };
 
-        if let Ok(img) = img_res {
-            let (w, h) = img.dimensions();
-            let raw_bytes = img.clone().into_raw();
-            let bytes = glib::Bytes::from(&raw_bytes);
-            let pixbuf = gdk_pixbuf::Pixbuf::from_bytes(
-                &bytes,
-                gdk_pixbuf::Colorspace::Rgb,
-                true,
-                8,
-                w as i32,
-                h as i32,
-                (w * 4) as i32,
-            );
-
-            // Enumerate open client windows for Overview mode
-            let win_infos = X11CaptureEngine::enumerate_client_windows();
-            let overview_windows = build_overview_windows(win_infos, w as f64, h as f64, Some(&pixbuf));
-
-            let cfg = self.app_state.get_config();
-            let mut inner = self.inner.borrow_mut();
-            inner.image = Some(img);
-            inner.pixbuf = Some(pixbuf);
-            inner.windows = overview_windows;
-            inner.hovered_window = None;
-            inner.zoom_animation = None;
-            inner.window_region_selected = None;
-
-            // Restore last region or default centered box
-            if let Some(last_r) = cfg.screenshot.last_region {
-                inner.crop = Some(last_r);
-            } else {
-                let default_w = 800.min(w.saturating_sub(100));
-                let default_h = 500.min(h.saturating_sub(100));
-                let default_x = (w.saturating_sub(default_w)) / 2;
-                let default_y = (h.saturating_sub(default_h)) / 2;
-                inner.crop = Some(Rect::new(default_x as i32, default_y as i32, default_w, default_h));
-            }
-            drop(inner);
-
-            // By default it should always be in Screenshot mode, Record mode should never be the default
-            self.set_action_mode(ActionMode::Screenshot);
-
-            self.window.show_all();
-            self.window.present();
-            self.drawing_area.queue_draw();
-
-            while gtk::events_pending() {
-                gtk::main_iteration();
-            }
-            self.grab_keyboard();
+        if self.last_cursor != Some(next) {
+            self.last_cursor = Some(next);
+            backend.set_cursor(WindowRole::OverlayFullscreen, next);
         }
     }
+
+    pub fn last_selection_to_persist(&self) -> Option<Rect> {
+        self.selection.filter(|r| r.width >= 16 && r.height >= 16)
+    }
+
+    fn present_dirty(&mut self, backend: &mut dyn DisplayBackend, dirty: Option<Rect>) {
+        self.render(dirty);
+        let _ = backend.present_surface_bgra(
+            WindowRole::OverlayFullscreen,
+            self.canvas.width,
+            self.canvas.height,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            dirty,
+        );
+    }
+
+    /// Computes exact responsive pill coordinates and clickable hitboxes cleanly before drawing.
+    pub fn layout_pill(&mut self) {
+        self.pill_buttons.clear();
+        let pad_x = 12i32;
+        let btn_h = 28i32;
+        let pill_h = 42i32;
+        let gap = 5i32;
+        let sep_w = 9i32;
+
+        struct Spec {
+            id: PillButtonId,
+            label: &'static str,
+            sep_after: bool,
+        }
+
+        let mut items = Vec::with_capacity(12);
+        items.push(Spec { id: PillButtonId::ModeScreenshot, label: "Screenshot", sep_after: false });
+        items.push(Spec { id: PillButtonId::ModeRecord, label: "Record", sep_after: true });
+
+        items.push(Spec { id: PillButtonId::TargetSelection, label: "Selection", sep_after: false });
+        items.push(Spec { id: PillButtonId::TargetWindow, label: "Window", sep_after: false });
+        items.push(Spec { id: PillButtonId::TargetWindowRegion, label: "Win Region", sep_after: false });
+        items.push(Spec { id: PillButtonId::TargetFullscreen, label: "Full Screen", sep_after: true });
+
+        if self.action_mode == ActionMode::Record {
+            items.push(Spec {
+                id: PillButtonId::ToggleMic,
+                label: if self.mic_enabled { "Mic: ON" } else { "Mic: OFF" },
+                sep_after: false,
+            });
+            items.push(Spec {
+                id: PillButtonId::ToggleAudio,
+                label: if self.audio_enabled { "Audio: ON" } else { "Audio: OFF" },
+                sep_after: true,
+            });
+            items.push(Spec { id: PillButtonId::DoneOrRecord, label: "Record", sep_after: true });
+        } else {
+            items.push(Spec { id: PillButtonId::DoneOrRecord, label: "Done", sep_after: false });
+            items.push(Spec { id: PillButtonId::SaveAs, label: "Save As", sep_after: true });
+        }
+
+        items.push(Spec { id: PillButtonId::Settings, label: "Settings", sep_after: false });
+        items.push(Spec { id: PillButtonId::Cancel, label: "Cancel", sep_after: false });
+
+        let widths: Vec<i32> = items
+            .iter()
+            .map(|s| {
+                let (tw, _) = self.canvas.measure_text(FontRole::Sans, 12.5, s.label);
+                tw + 20
+            })
+            .collect();
+
+        let content_w: i32 = widths.iter().sum::<i32>()
+            + gap * (items.len() as i32 - 1)
+            + items.iter().filter(|s| s.sep_after).count() as i32 * sep_w;
+
+        let pill_w = content_w + pad_x * 2;
+        let pill_x = ((self.screen_w as i32 - pill_w) / 2).max(12);
+        let pill_y = (self.screen_h as i32 - 32 - pill_h).max(12);
+        self.pill_rect = Rect::new(pill_x, pill_y, pill_w as u32, pill_h as u32);
+
+        let mut cx = pill_x + pad_x;
+        let btn_y = pill_y + (pill_h - btn_h) / 2;
+        for (i, item) in items.iter().enumerate() {
+            let bw = widths[i];
+            self.pill_buttons.push(PillButtonRect {
+                id: item.id,
+                rect: Rect::new(cx, btn_y, bw as u32, btn_h as u32),
+            });
+            cx += bw + gap;
+            if item.sep_after {
+                cx += sep_w;
+            }
+        }
+    }
+
+    pub fn render(&mut self, clip: Option<Rect>) {
+        let Some(desktop) = self.desktop.take() else {
+            return;
+        };
+        let w = self.screen_w;
+        let h = self.screen_h;
+
+        match self.target_mode {
+            TargetMode::Fullscreen => {
+                // Full screen intentionally draws ZERO border boxes or dimming so the user gets an unobstructed preview
+                self.canvas.blit_desktop_vignette(
+                    &desktop,
+                    Some(Rect::new(0, 0, w, h)),
+                    0,
+                    clip,
+                );
+            }
+            TargetMode::Selection => {
+                let active = self.selection.filter(|r| r.width >= 2 && r.height >= 2);
+                self.canvas.blit_desktop_vignette(&desktop, active, 115, clip);
+                if let Some(r) = active {
+                    self.draw_selection_chrome(r, r.width, r.height, clip);
+                }
+            }
+            TargetMode::Window => {
+                self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
+                self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 130], clip);
+                let title = if self.action_mode == ActionMode::Record {
+                    "Click a window to record  (Esc to cancel)"
+                } else {
+                    "Click a window to capture  (Esc to cancel)"
+                };
+                self.draw_overview_mosaic(title, clip);
+            }
+            TargetMode::WindowRegion => {
+                self.canvas.blit_desktop_vignette(&desktop, None, 185, clip);
+                self.canvas.draw_sharp_rect(0, 0, w, h, [15, 15, 23, 145], clip);
+                if let Some(idx) = self.zoomed_card {
+                    self.draw_zoomed_window(idx, &desktop, clip);
+                } else {
+                    self.draw_overview_mosaic("Click a window to zoom in & select a region  (Esc to cancel)", clip);
+                }
+            }
+        }
+
+        self.draw_pill(clip);
+        self.desktop = Some(desktop);
+    }
+
+    fn draw_selection_chrome(&mut self, r: Rect, label_w: u32, label_h: u32, clip: Option<Rect>) {
+        // 2px crisp #6366f1 border
+        self.canvas.stroke_sharp_rect(
+            r.x,
+            r.y,
+            r.width,
+            r.height,
+            2,
+            [99, 102, 241, 245],
+            clip,
+        );
+
+        // 8 crisp 8x8 resize handles
+        if r.width >= 12 && r.height >= 12 {
+            let x0 = r.x as f32;
+            let y0 = r.y as f32;
+            let x1 = (r.x + r.width as i32) as f32;
+            let y1 = (r.y + r.height as i32) as f32;
+            let cx = (x0 + x1) * 0.5;
+            let cy = (y0 + y1) * 0.5;
+            let pts = [
+                (x0, y0),
+                (cx, y0),
+                (x1, y0),
+                (x1, cy),
+                (x1, y1),
+                (cx, y1),
+                (x0, y1),
+                (x0, cy),
+            ];
+            for (hx, hy) in pts {
+                self.canvas.draw_sharp_rect(
+                    hx.round() as i32 - 4,
+                    hy.round() as i32 - 4,
+                    8,
+                    8,
+                    [255, 255, 255, 255],
+                    clip,
+                );
+                self.canvas.stroke_sharp_rect(
+                    hx.round() as i32 - 4,
+                    hy.round() as i32 - 4,
+                    8,
+                    8,
+                    1,
+                    [99, 102, 241, 255],
+                    clip,
+                );
+            }
+        }
+
+        // Crisp Mono dimension badge
+        let txt = format!("{label_w} x {label_h} px");
+        let (tw, _th) = self.canvas.measure_text(FontRole::Mono, 11.5, &txt);
+        let bw = tw + 16;
+        let bh = 22i32;
+        let bx = r.x.clamp(8, (self.screen_w as i32 - bw - 8).max(8));
+        let by = if r.y >= 34 {
+            r.y - bh - 6
+        } else if r.y + r.height as i32 + bh + 10 < self.pill_rect.y {
+            r.y + r.height as i32 + 6
+        } else {
+            r.y + 8
+        };
+
+        let badge_r = Rect::new(bx, by, bw as u32, bh as u32);
+        if let Some(c) = clip {
+            if !rects_intersect(c, badge_r.outset(4)) {
+                return;
+            }
+        }
+        self.canvas.fill_rounded_rect(
+            bx as f32,
+            by as f32,
+            bw as f32,
+            bh as f32,
+            6.0,
+            [24, 24, 27, 236],
+            clip,
+        );
+        self.canvas.stroke_rounded_rect(
+            bx as f32,
+            by as f32,
+            bw as f32,
+            bh as f32,
+            6.0,
+            1.0,
+            [255, 255, 255, 38],
+            clip,
+        );
+        self.canvas
+            .draw_text(FontRole::Mono, 11.5, bx + 8, by + 15, &txt, [244, 244, 245, 255]);
+    }
+
+    fn draw_overview_mosaic(&mut self, header: &str, clip: Option<Rect>) {
+        let (hw, _) = self.canvas.measure_text(FontRole::Sans, 14.0, header);
+        let hx = ((self.screen_w as i32 - hw) / 2).max(16);
+        self.canvas
+            .draw_text(FontRole::Sans, 14.0, hx, 48, header, [244, 244, 245, 255]);
+
+        if self.cards.is_empty() {
+            let empty = "No open application windows detected";
+            let (ew, _) = self.canvas.measure_text(FontRole::Sans, 13.0, empty);
+            self.canvas.draw_text(
+                FontRole::Sans,
+                13.0,
+                (self.screen_w as i32 - ew) / 2,
+                (self.screen_h as i32) / 2,
+                empty,
+                [161, 161, 170, 255],
+            );
+            return;
+        }
+
+        let card_count = self.cards.len();
+        for idx in 0..card_count {
+            let card_rect = self.cards[idx].card_rect;
+            let thumb_rect = self.cards[idx].thumb_rect;
+            if let Some(c) = clip {
+                if !rects_intersect(c, card_rect.outset(14)) {
+                    continue;
+                }
+            }
+            let hovered = self.hovered_card == Some(idx);
+
+            self.canvas.draw_shadow_rounded_rect(
+                thumb_rect.x as f32,
+                thumb_rect.y as f32,
+                thumb_rect.width as f32,
+                thumb_rect.height as f32,
+                10.0,
+                12.0,
+                if hovered { 130 } else { 85 },
+                clip,
+            );
+            self.canvas.fill_rounded_rect(
+                thumb_rect.x as f32,
+                thumb_rect.y as f32,
+                thumb_rect.width as f32,
+                thumb_rect.height as f32,
+                10.0,
+                [24, 24, 27, 235],
+                clip,
+            );
+
+            let preview_opt = self.cards[idx].window.preview.clone();
+            if let Some(ref preview) = preview_opt {
+                self.canvas.blit_scaled_rounded_image(
+                    preview,
+                    thumb_rect.x as f32,
+                    thumb_rect.y as f32,
+                    thumb_rect.width as f32,
+                    thumb_rect.height as f32,
+                    10.0,
+                    255,
+                    clip,
+                );
+            }
+
+            let border_rgba = if hovered {
+                [99, 102, 241, 255]
+            } else {
+                [255, 255, 255, 36]
+            };
+            self.canvas.stroke_rounded_rect(
+                thumb_rect.x as f32,
+                thumb_rect.y as f32,
+                thumb_rect.width as f32,
+                thumb_rect.height as f32,
+                10.0,
+                if hovered { 2.5 } else { 1.0 },
+                border_rgba,
+                clip,
+            );
+
+            // Title caption centered under card thumbnail
+            let win = &self.cards[idx].window;
+            let raw_title = if win.title.is_empty() {
+                win.app_id.as_str()
+            } else {
+                win.title.as_str()
+            };
+            let title_short: String = if raw_title.chars().count() > 36 {
+                format!("{}...", raw_title.chars().take(33).collect::<String>())
+            } else {
+                raw_title.to_string()
+            };
+            let (tw, _) = self.canvas.measure_text(FontRole::Sans, 12.0, &title_short);
+            let tx = card_rect.x + ((card_rect.width as i32 - tw) / 2).max(0);
+            let ty = thumb_rect.y + thumb_rect.height as i32 + 18;
+            self.canvas.draw_text(
+                FontRole::Sans,
+                12.0,
+                tx,
+                ty,
+                &title_short,
+                if hovered { [255, 255, 255, 255] } else { [212, 212, 216, 255] },
+            );
+        }
+    }
+
+    fn draw_zoomed_window(&mut self, idx: usize, desktop: &PixelImage, clip: Option<Rect>) {
+        let Some(card) = self.cards.get(idx).cloned() else {
+            return;
+        };
+
+        let anim_t = match self.zoom_start {
+            Some(s) => (s.elapsed().as_secs_f32() / (ZOOM_DURATION_MS as f32 / 1000.0)).clamp(0.0, 1.0),
+            None => 1.0,
+        };
+        let draw_rect = if anim_t < 1.0 {
+            ease_out_cubic_rect(self.zoom_from, self.zoom_to, anim_t)
+        } else {
+            self.zoom_to
+        };
+
+        let title = format!("Drag to select a region inside \"{}\"  (Esc to back)", card.window.title);
+        let (hw, _) = self.canvas.measure_text(FontRole::Sans, 13.0, &title);
+        self.canvas.draw_text(
+            FontRole::Sans,
+            13.0,
+            ((self.screen_w as i32 - hw) / 2).max(16),
+            48,
+            &title,
+            [244, 244, 245, 255],
+        );
+
+        self.canvas.draw_shadow_rounded_rect(
+            draw_rect.x as f32,
+            draw_rect.y as f32,
+            draw_rect.width as f32,
+            draw_rect.height as f32,
+            10.0,
+            16.0,
+            135,
+            clip,
+        );
+
+        let src_img = card.window.preview.as_ref().or_else(|| {
+            let wr = card.window.rect.clamp_bounds(self.screen_w, self.screen_h);
+            let _ = (wr, desktop);
+            None
+        });
+        if let Some(img) = src_img {
+            self.canvas.blit_scaled_rounded_image(
+                img,
+                draw_rect.x as f32,
+                draw_rect.y as f32,
+                draw_rect.width as f32,
+                draw_rect.height as f32,
+                10.0,
+                255,
+                clip,
+            );
+        } else if let Some(cropped) = desktop.crop_rect(
+            card.window.rect.x.max(0) as u32,
+            card.window.rect.y.max(0) as u32,
+            card.window.rect.width,
+            card.window.rect.height,
+        ) {
+            self.canvas.blit_scaled_rounded_image(
+                &cropped,
+                draw_rect.x as f32,
+                draw_rect.y as f32,
+                draw_rect.width as f32,
+                draw_rect.height as f32,
+                10.0,
+                255,
+                clip,
+            );
+        }
+
+        self.canvas.stroke_rounded_rect(
+            draw_rect.x as f32,
+            draw_rect.y as f32,
+            draw_rect.width as f32,
+            draw_rect.height as f32,
+            10.0,
+            1.5,
+            [255, 255, 255, 48],
+            clip,
+        );
+
+        if anim_t >= 1.0 {
+            if let Some(sel) = self.zoom_selection.filter(|r| r.width >= 2 && r.height >= 2) {
+                let src_w = card
+                    .window
+                    .preview
+                    .as_ref()
+                    .map(|p| p.width)
+                    .unwrap_or(card.window.rect.width)
+                    .max(1);
+                let src_h = card
+                    .window
+                    .preview
+                    .as_ref()
+                    .map(|p| p.height)
+                    .unwrap_or(card.window.rect.height)
+                    .max(1);
+                let aw = ((sel.width as f64 / draw_rect.width.max(1) as f64) * src_w as f64).round() as u32;
+                let ah = ((sel.height as f64 / draw_rect.height.max(1) as f64) * src_h as f64).round() as u32;
+                self.draw_selection_chrome(sel, aw.max(1), ah.max(1), clip);
+            }
+        }
+    }
+
+    fn draw_pill(&mut self, clip: Option<Rect>) {
+        if let Some(c) = clip {
+            if !rects_intersect(c, self.pill_rect.outset(16)) {
+                return;
+            }
+        }
+
+        let p = self.pill_rect;
+        self.canvas.draw_shadow_rounded_rect(
+            p.x as f32,
+            p.y as f32,
+            p.width as f32,
+            p.height as f32,
+            20.0,
+            14.0,
+            115,
+            clip,
+        );
+        self.canvas.fill_rounded_rect(
+            p.x as f32,
+            p.y as f32,
+            p.width as f32,
+            p.height as f32,
+            20.0,
+            [24, 24, 27, 242],
+            clip,
+        );
+        self.canvas.stroke_rounded_rect(
+            p.x as f32,
+            p.y as f32,
+            p.width as f32,
+            p.height as f32,
+            20.0,
+            1.0,
+            [255, 255, 255, 31],
+            clip,
+        );
+
+        let btns = self.pill_buttons.clone();
+        for (idx, b) in btns.iter().enumerate() {
+            let hovered = self.hovered_btn == Some(b.id);
+            let active = match b.id {
+                PillButtonId::ModeScreenshot => self.action_mode == ActionMode::Screenshot,
+                PillButtonId::ModeRecord => self.action_mode == ActionMode::Record,
+                PillButtonId::TargetSelection => self.target_mode == TargetMode::Selection,
+                PillButtonId::TargetWindow => self.target_mode == TargetMode::Window,
+                PillButtonId::TargetWindowRegion => self.target_mode == TargetMode::WindowRegion,
+                PillButtonId::TargetFullscreen => self.target_mode == TargetMode::Fullscreen,
+                PillButtonId::ToggleMic => self.mic_enabled,
+                PillButtonId::ToggleAudio => self.audio_enabled,
+                _ => false,
+            };
+
+            let label = match b.id {
+                PillButtonId::ModeScreenshot => "Screenshot",
+                PillButtonId::ModeRecord => "Record",
+                PillButtonId::TargetSelection => "Selection",
+                PillButtonId::TargetWindow => "Window",
+                PillButtonId::TargetWindowRegion => "Win Region",
+                PillButtonId::TargetFullscreen => "Full Screen",
+                PillButtonId::ToggleMic => if self.mic_enabled { "Mic: ON" } else { "Mic: OFF" },
+                PillButtonId::ToggleAudio => if self.audio_enabled { "Audio: ON" } else { "Audio: OFF" },
+                PillButtonId::DoneOrRecord => {
+                    if self.action_mode == ActionMode::Record {
+                        "Record"
+                    } else {
+                        "Done"
+                    }
+                }
+                PillButtonId::SaveAs => "Save As",
+                PillButtonId::Settings => "Settings",
+                PillButtonId::Cancel => "Cancel",
+            };
+
+            let (bg, fg) = match b.id {
+                PillButtonId::DoneOrRecord => {
+                    if self.action_mode == ActionMode::Record {
+                        (
+                            if hovered { [220, 38, 38, 255] } else { [239, 68, 68, 255] },
+                            [255, 255, 255, 255],
+                        )
+                    } else {
+                        (
+                            if hovered { [228, 228, 231, 255] } else { [255, 255, 255, 255] },
+                            [9, 9, 11, 255],
+                        )
+                    }
+                }
+                PillButtonId::ToggleMic | PillButtonId::ToggleAudio => {
+                    if active {
+                        (
+                            if hovered { [22, 163, 74, 235] } else { [22, 163, 74, 185] },
+                            [255, 255, 255, 255],
+                        )
+                    } else {
+                        (
+                            if hovered { [63, 63, 70, 210] } else { [39, 39, 42, 175] },
+                            [161, 161, 170, 255],
+                        )
+                    }
+                }
+                PillButtonId::TargetSelection
+                | PillButtonId::TargetWindow
+                | PillButtonId::TargetWindowRegion
+                | PillButtonId::TargetFullscreen
+                | PillButtonId::ModeScreenshot
+                | PillButtonId::ModeRecord => {
+                    if active {
+                        ([63, 63, 70, 240], [255, 255, 255, 255])
+                    } else if hovered {
+                        ([63, 63, 70, 140], [244, 244, 245, 255])
+                    } else {
+                        ([0, 0, 0, 0], [161, 161, 170, 255])
+                    }
+                }
+                PillButtonId::SaveAs | PillButtonId::Settings | PillButtonId::Cancel => {
+                    if hovered {
+                        ([63, 63, 70, 170], [255, 255, 255, 255])
+                    } else {
+                        ([39, 39, 42, 140], [212, 212, 216, 255])
+                    }
+                }
+            };
+
+            if bg[3] > 0 {
+                self.canvas.fill_rounded_rect(
+                    b.rect.x as f32,
+                    b.rect.y as f32,
+                    b.rect.width as f32,
+                    b.rect.height as f32,
+                    12.0,
+                    bg,
+                    clip,
+                );
+            }
+
+            let (tw, _) = self.canvas.measure_text(FontRole::Sans, 12.5, label);
+            let tx = b.rect.x + ((b.rect.width as i32 - tw) / 2).max(0);
+            let ty = b.rect.y + 18;
+            self.canvas.draw_text(FontRole::Sans, 12.5, tx, ty, label, fg);
+
+            // Subtle 1px divider between logical pill button groups
+            let has_sep = match b.id {
+                PillButtonId::ModeRecord
+                | PillButtonId::TargetFullscreen
+                | PillButtonId::ToggleAudio
+                | PillButtonId::SaveAs => true,
+                PillButtonId::DoneOrRecord => self.action_mode == ActionMode::Record,
+                _ => false,
+            };
+            if has_sep && idx + 1 < btns.len() {
+                let sx = b.rect.x + b.rect.width as i32 + 9;
+                self.canvas.draw_sharp_rect(
+                    sx,
+                    p.y + 11,
+                    1,
+                    (p.height as i32 - 22).max(4) as u32,
+                    [255, 255, 255, 32],
+                    clip,
+                );
+            }
+        }
+    }
+}
+
+#[inline]
+fn rects_intersect(a: Rect, b: Rect) -> bool {
+    a.x < b.x + b.width as i32
+        && a.x + a.width as i32 > b.x
+        && a.y < b.y + b.height as i32
+        && a.y + a.height as i32 > b.y
 }

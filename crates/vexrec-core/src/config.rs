@@ -1,8 +1,12 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::error::{VexrecError, Result};
-use crate::formats::{AudioCodec, ContainerFormat, ImageFormat, VideoCodec, VideoQuality};
+use crate::formats::{
+    AudioCodec, CompressionSpeed, ContainerFormat, EncoderBackendPreference, ImageFormat,
+    VideoCodec, VideoQuality,
+};
 use crate::geometry::Rect;
+use crate::xdg;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
@@ -49,7 +53,7 @@ impl Default for VexrecConfig {
 
 impl VexrecConfig {
     pub fn config_path() -> PathBuf {
-        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        let base = xdg::config_dir();
         let vexrec_path = base.join("vexrec").join("config.toml");
         if vexrec_path.exists() {
             return vexrec_path;
@@ -84,8 +88,12 @@ impl VexrecConfig {
     }
 }
 
-fn default_false() -> bool {
+const fn default_false() -> bool {
     false
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +107,12 @@ pub struct RecordingConfig {
     pub show_recording_frame: bool,
     pub hardware_accel: bool,
     pub capture_region: Option<Rect>,
+    #[serde(default)]
+    pub encoder_preference: EncoderBackendPreference,
+    #[serde(default = "default_true")]
+    pub prefer_fragmented_mp4: bool,
+    #[serde(default = "default_true")]
+    pub damage_driven_capture: bool,
 }
 
 impl Default for RecordingConfig {
@@ -112,6 +126,9 @@ impl Default for RecordingConfig {
             show_recording_frame: false,
             hardware_accel: true,
             capture_region: None,
+            encoder_preference: EncoderBackendPreference::Auto,
+            prefer_fragmented_mp4: true,
+            damage_driven_capture: true,
         }
     }
 }
@@ -196,6 +213,10 @@ pub struct ScreenshotConfig {
     pub last_mode: Option<String>,
     #[serde(default)]
     pub last_region: Option<Rect>,
+    #[serde(default = "default_true")]
+    pub clipboard_lazy_encode: bool,
+    #[serde(default)]
+    pub compression_level: CompressionSpeed,
 }
 
 impl Default for ScreenshotConfig {
@@ -208,6 +229,8 @@ impl Default for ScreenshotConfig {
             include_cursor: false,
             last_mode: Some("area".to_string()),
             last_region: None,
+            clipboard_lazy_encode: true,
+            compression_level: CompressionSpeed::Fast,
         }
     }
 }
@@ -221,8 +244,8 @@ pub struct StorageConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        let pictures = dirs::picture_dir().unwrap_or_else(|| PathBuf::from("~/Pictures"));
-        let videos = dirs::video_dir().unwrap_or_else(|| PathBuf::from("~/Videos"));
+        let pictures = xdg::picture_dir();
+        let videos = xdg::video_dir();
         Self {
             screenshot_dir: pictures.join("Vexrec"),
             recording_dir: videos.join("Vexrec"),
@@ -254,8 +277,7 @@ impl Default for HotkeyConfig {
     }
 }
 
-/// Given a target file path, returns the path itself if it does not exist,
-/// or appends -1, -2, -3, etc. before the extension until an unused path is found.
+/// Returns `path` if unused, otherwise appends `-1`, `-2`, ... before the extension.
 pub fn ensure_unique_path<P: AsRef<Path>>(path: P) -> PathBuf {
     let path = path.as_ref();
     if !path.exists() {
@@ -265,11 +287,11 @@ pub fn ensure_unique_path<P: AsRef<Path>>(path: P) -> PathBuf {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     let ext = path.extension().and_then(|s| s.to_str());
 
-    let mut counter = 1;
+    let mut counter = 1u32;
     loop {
         let new_name = match ext {
-            Some(e) => format!("{}-{}.{}", stem, counter, e),
-            None => format!("{}-{}", stem, counter),
+            Some(e) => format!("{stem}-{counter}.{e}"),
+            None => format!("{stem}-{counter}"),
         };
         let candidate = parent.join(new_name);
         if !candidate.exists() {

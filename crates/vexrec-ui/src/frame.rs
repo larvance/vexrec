@@ -1,84 +1,80 @@
-use cairo::Region;
-use gtk::prelude::*;
+use std::sync::Arc;
 use vexrec_core::geometry::Rect;
+use vexrec_display::{DisplayBackend, WindowRole};
+use vexrec_os::fonts::FontEngine;
+use vexrec_render::SurfaceCanvas;
 
-pub struct RecordingFrameWindow {
-    window: gtk::Window,
+const OUTER_PAD: i32 = 4;
+const BORDER_W: i32 = 2;
+
+/// Optional exterior click-through recording border (`2px` `#ef4444` outside `crop`, off by default, never in fullscreen).
+pub struct FrameController {
+    canvas: SurfaceCanvas,
+    visible: bool,
+    outer_geom: Rect,
 }
 
-impl RecordingFrameWindow {
-    pub fn new() -> Self {
-        let window = gtk::Window::new(gtk::WindowType::Toplevel);
-        window.set_title("Vexrec Frame");
-        window.set_decorated(false);
-        window.set_skip_taskbar_hint(true);
-        window.set_skip_pager_hint(true);
-        window.set_keep_above(true);
-        window.set_accept_focus(false);
-        window.set_app_paintable(true);
-
-        if let Some(screen) = gtk::prelude::GtkWindowExt::screen(&window) {
-            if let Some(visual) = screen.rgba_visual() {
-                window.set_visual(Some(&visual));
-            }
+impl FrameController {
+    pub fn new(fonts: Arc<FontEngine>) -> Self {
+        Self {
+            canvas: SurfaceCanvas::new(64, 64, fonts),
+            visible: false,
+            outer_geom: Rect::default(),
         }
-
-        // Set input shape to empty region on map so all clicks pass through completely
-        window.connect_map(|win| {
-            if let Some(gdk_win) = win.window() {
-                let empty_region = Region::create();
-                gdk_win.input_shape_combine_region(&empty_region, 0, 0);
-            }
-        });
-
-        // Draw 2px border strictly on outer perimeter without inner glow
-        window.connect_draw(|_win, cr| {
-            let width = _win.allocated_width() as f64;
-            let height = _win.allocated_height() as f64;
-
-            // Clear to transparent
-            cr.set_operator(cairo::Operator::Source);
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-            let _ = cr.paint();
-
-            // Draw outer perimeter border: 2px red (#ef4444)
-            cr.set_operator(cairo::Operator::Over);
-            cr.set_source_rgba(0.937, 0.267, 0.267, 0.95);
-            cr.set_line_width(2.0);
-            cr.rectangle(1.0, 1.0, width - 2.0, height - 2.0);
-            let _ = cr.stroke();
-
-            glib::Propagation::Proceed
-        });
-
-        Self { window }
     }
 
-    pub fn show_frame(&self, crop: Option<Rect>) {
-        // Never show a recording frame for fullscreen recording
+    pub fn show(&mut self, backend: &mut dyn DisplayBackend, crop: Option<Rect>, enabled: bool) {
+        // Never display a border frame in Full Screen mode or when disabled in config
         let Some(r) = crop else {
-            self.window.hide();
+            self.hide(backend);
             return;
         };
-
-        const BORDER: i32 = 4;
-        let px = (r.x - BORDER).max(0);
-        let py = (r.y - BORDER).max(0);
-        let pw = r.width as i32 + 2 * BORDER;
-        let ph = r.height as i32 + 2 * BORDER;
-
-        self.window.move_(px, py);
-        self.window.resize(pw, ph);
-        self.window.show_all();
-
-        // Re-assert click-through region
-        if let Some(gdk_win) = self.window.window() {
-            let empty_region = Region::create();
-            gdk_win.input_shape_combine_region(&empty_region, 0, 0);
+        if !enabled || r.width < 8 || r.height < 8 {
+            self.hide(backend);
+            return;
         }
+
+        let gx = (r.x - OUTER_PAD).max(0);
+        let gy = (r.y - OUTER_PAD).max(0);
+        let gw = r.width + (OUTER_PAD * 2) as u32;
+        let gh = r.height + (OUTER_PAD * 2) as u32;
+        self.outer_geom = Rect::new(gx, gy, gw, gh);
+        self.canvas.resize(gw, gh);
+        self.canvas.clear_transparent(None);
+        self.canvas
+            .stroke_sharp_rect(0, 0, gw, gh, BORDER_W, [239, 68, 68, 220], None);
+        self.visible = true;
+
+        backend.show_surface(WindowRole::RecordingFrame, self.outer_geom);
+        let _ = backend.present_surface_bgra(
+            WindowRole::RecordingFrame,
+            self.canvas.width,
+            self.canvas.height,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
     }
 
-    pub fn hide_frame(&self) {
-        self.window.hide();
+    pub fn on_expose(&self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        let _ = backend.present_surface_bgra(
+            WindowRole::RecordingFrame,
+            self.canvas.width,
+            self.canvas.height,
+            self.canvas.stride,
+            self.canvas.data.as_slice(),
+            None,
+        );
+    }
+
+    pub fn hide(&mut self, backend: &mut dyn DisplayBackend) {
+        if !self.visible {
+            return;
+        }
+        self.visible = false;
+        backend.hide_surface(WindowRole::RecordingFrame);
     }
 }
