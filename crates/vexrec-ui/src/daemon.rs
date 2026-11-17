@@ -25,6 +25,7 @@ use vexrec_os::dbus::{
 };
 use vexrec_os::fonts::FontEngine;
 use vexrec_os::ipc::{bind_daemon_listener, read_incoming_command, IpcOpCode};
+use vexrec_os::tray::{TrayAction, TrayIndicator};
 
 use crate::frame::FrameController;
 use crate::indicator::IndicatorController;
@@ -41,6 +42,7 @@ enum DaemonBgMsg {
     ScreenshotDirPicked(PathBuf),
     RecordingDirPicked(PathBuf),
     SaveAsPathPicked(Option<PathBuf>),
+    TrayAction(TrayAction),
 }
 
 /// Zero-GTK, zero-tokio bare-metal daemon reactor multiplexed over Linux `epoll` (`polling`).
@@ -53,6 +55,7 @@ pub struct DaemonApp {
     settings: SettingsController,
     recorder: Option<RecordingPipeline>,
     notif: Arc<NotificationHub>,
+    tray: TrayIndicator,
     ipc_listener: UnixListener,
     wake_rx: UnixStream,
     wake_tx: UnixStream,
@@ -81,6 +84,14 @@ impl DaemonApp {
 
         let (msg_tx, msg_rx) = mpsc::channel();
         let notif = Arc::new(NotificationHub::start());
+        let tx_tray = msg_tx.clone();
+        let wake_tray = wake_tx.try_clone().ok();
+        let tray = TrayIndicator::start(move |action| {
+            let _ = tx_tray.send(DaemonBgMsg::TrayAction(action));
+            if let Some(ref w) = wake_tray {
+                let _ = (&*w).write_all(&[1u8]);
+            }
+        });
 
         if backend.session_kind().is_wayland() {
             let tx_portal = msg_tx.clone();
@@ -106,6 +117,7 @@ impl DaemonApp {
             settings: SettingsController::new(fonts),
             recorder: None,
             notif,
+            tray,
             ipc_listener,
             wake_rx,
             wake_tx,
@@ -148,8 +160,9 @@ impl DaemonApp {
                 last_live_refresh = std::time::Instant::now();
             }
             if let Some(rec) = &self.recorder {
-                self.indicator
-                    .update(&mut *self.backend, rec.elapsed_seconds(), rec.is_paused());
+                let secs = rec.elapsed_seconds();
+                let paused = rec.is_paused();
+                self.sync_recording_indicators(secs, paused);
             }
 
             if !self.running {
@@ -326,29 +339,17 @@ impl DaemonApp {
                                 let _ = stream.write_all(msg.as_bytes());
                             }
                         },
-                        Ok((IpcOpCode::TogglePause, _)) => {
-                            if let Some(rec) = &self.recorder {
-                                if rec.is_paused() {
-                                    rec.resume();
-                                    self.indicator.update(
-                                        &mut *self.backend,
-                                        rec.elapsed_seconds(),
-                                        false,
-                                    );
-                                    let _ = stream.write_all(b"OK: resumed\n");
-                                } else {
-                                    rec.pause();
-                                    self.indicator.update(
-                                        &mut *self.backend,
-                                        rec.elapsed_seconds(),
-                                        true,
-                                    );
-                                    let _ = stream.write_all(b"OK: paused\n");
-                                }
-                            } else {
+                        Ok((IpcOpCode::TogglePause, _)) => match self.toggle_recording_pause() {
+                            Some(true) => {
+                                let _ = stream.write_all(b"OK: paused\n");
+                            }
+                            Some(false) => {
+                                let _ = stream.write_all(b"OK: resumed\n");
+                            }
+                            None => {
                                 let _ = stream.write_all(b"OK: no active recording\n");
                             }
-                        }
+                        },
                         Ok((IpcOpCode::Ping, _)) => {
                             let _ = stream.write_all(b"pong\n");
                         }
@@ -420,6 +421,14 @@ impl DaemonApp {
                         self.pending_save_as_img = None;
                     }
                 }
+                DaemonBgMsg::TrayAction(action) => match action {
+                    TrayAction::StopRecording => {
+                        let _ = self.stop_recording();
+                    }
+                    TrayAction::TogglePause => {
+                        let _ = self.toggle_recording_pause();
+                    }
+                },
             }
         }
     }
@@ -649,7 +658,10 @@ impl DaemonApp {
         )?;
         self.recorder = Some(pipeline);
 
-        self.indicator.show(&mut *self.backend);
+        self.tray.show_recording(0, false);
+        if !self.tray.is_host_active() {
+            self.indicator.show(&mut *self.backend);
+        }
         self.frame.show(
             &mut *self.backend,
             crop,
@@ -659,6 +671,7 @@ impl DaemonApp {
     }
 
     fn stop_recording(&mut self) -> Result<Option<RecordingSummary>> {
+        self.tray.hide();
         self.indicator.hide(&mut *self.backend);
         self.frame.hide(&mut *self.backend);
 
@@ -679,6 +692,34 @@ impl DaemonApp {
         );
         Ok(Some(summary))
     }
+
+    fn sync_recording_indicators(&mut self, secs: u64, paused: bool) {
+        self.tray.update_timer(secs, paused);
+        if self.tray.is_host_active() {
+            if self.indicator.is_visible() {
+                self.indicator.hide(&mut *self.backend);
+            }
+        } else {
+            if !self.indicator.is_visible() {
+                self.indicator.show(&mut *self.backend);
+            }
+            self.indicator.update(&mut *self.backend, secs, paused);
+        }
+    }
+
+    fn toggle_recording_pause(&mut self) -> Option<bool> {
+        let (secs, paused) = {
+            let rec = self.recorder.as_ref()?;
+            if rec.is_paused() {
+                rec.resume();
+            } else {
+                rec.pause();
+            }
+            (rec.elapsed_seconds(), rec.is_paused())
+        };
+        self.sync_recording_indicators(secs, paused);
+        Some(paused)
+    }
 }
 
 pub fn render_filename(pattern: &str, capture_type: &str) -> String {
@@ -689,7 +730,9 @@ pub fn render_filename(pattern: &str, capture_type: &str) -> String {
 }
 
 pub fn build_output_path(dir: &Path, pattern: &str, capture_type: &str, ext: &str) -> PathBuf {
+    let base_dir = vexrec_core::expand_tilde(dir);
+    let _ = std::fs::create_dir_all(&base_dir);
     let base = render_filename(pattern, capture_type);
-    let candidate = dir.join(format!("{base}.{ext}"));
+    let candidate = base_dir.join(format!("{base}.{ext}"));
     ensure_unique_path(candidate)
 }

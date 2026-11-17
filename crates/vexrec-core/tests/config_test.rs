@@ -123,3 +123,16 @@ fn test_aligned_vec_and_crop() {
     assert_eq!((cropped.width, cropped.height), (4, 2));
     assert_eq!(&cropped.as_bytes()[0..4], &[5, 3, 99, 255]);
 }
+
+#[test]
+fn test_config_from_toml_expands_tilde_storage_dirs() {
+    let mut base = VexrecConfig::default();
+    base.storage.screenshot_dir = std::path::PathBuf::from("~/Pictures/Vexrec");
+    base.storage.recording_dir = std::path::PathBuf::from("~/Videos/Vexrec");
+    let raw = toml::to_string_pretty(&base).expect("serialize config");
+
+    let loaded = VexrecConfig::from_toml_str(&raw).expect("parse config with ~ paths");
+    let home = vexrec_core::xdg::home_dir();
+    assert_eq!(loaded.storage.screenshot_dir, home.join("Pictures/Vexrec"));
+    assert_eq!(loaded.storage.recording_dir, home.join("Videos/Vexrec"));
+}

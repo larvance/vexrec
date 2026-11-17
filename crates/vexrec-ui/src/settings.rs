@@ -107,7 +107,7 @@ impl SettingsController {
     }
 
     pub fn set_screenshot_dir(&mut self, backend: &mut dyn DisplayBackend, dir: PathBuf) {
-        self.draft.storage.screenshot_dir = dir;
+        self.draft.storage.screenshot_dir = vexrec_core::expand_tilde(&dir);
         if self.visible {
             self.rebuild_layout_and_render();
             self.present(backend);
@@ -115,7 +115,7 @@ impl SettingsController {
     }
 
     pub fn set_recording_dir(&mut self, backend: &mut dyn DisplayBackend, dir: PathBuf) {
-        self.draft.storage.recording_dir = dir;
+        self.draft.storage.recording_dir = vexrec_core::expand_tilde(&dir);
         if self.visible {
             self.rebuild_layout_and_render();
             self.present(backend);

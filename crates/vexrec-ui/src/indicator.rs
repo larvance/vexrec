@@ -4,10 +4,10 @@ use vexrec_display::{CursorKind, DisplayBackend, WindowRole};
 use vexrec_os::fonts::{FontEngine, FontRole};
 use vexrec_render::SurfaceCanvas;
 
-pub const INDICATOR_W: u32 = 100;
+pub const INDICATOR_W: u32 = 112;
 pub const INDICATOR_H: u32 = 28;
 
-/// Minimalist top-right floating recording timer pill (`100x28`) with click-to-stop interaction.
+/// Minimalist top-right floating outlined recording timer pill (`112x28`) with click-to-stop interaction.
 pub struct IndicatorController {
     canvas: SurfaceCanvas,
     visible: bool,
@@ -101,35 +101,28 @@ impl IndicatorController {
         let w = INDICATOR_W as f32;
         let h = INDICATOR_H as f32;
         self.canvas
-            .fill_rounded_rect(0.0, 0.0, w, h, 14.0, [24, 24, 27, 242], None);
+            .fill_rounded_rect(0.0, 0.0, w, h, 14.0, [14, 14, 17, 175], None);
+
+        let (border_rgba, text_rgba) = if paused {
+            ([161, 161, 170, 165], [161, 161, 170, 235])
+        } else {
+            ([244, 244, 245, 210], [250, 250, 250, 255])
+        };
         self.canvas.stroke_rounded_rect(
-            0.5,
-            0.5,
-            w - 1.0,
-            h - 1.0,
-            13.5,
-            1.0,
-            [255, 255, 255, 36],
+            0.75,
+            0.75,
+            w - 1.5,
+            h - 1.5,
+            13.25,
+            1.35,
+            border_rgba,
             None,
         );
 
-        let dot_rgba = if paused {
-            [234, 179, 8, 255]
-        } else {
-            [239, 68, 68, 255]
-        };
-        self.canvas.fill_circle(18.0, 14.0, 4.5, dot_rgba, None);
-
-        let mins = secs / 60;
-        let rem = secs % 60;
-        let text = format!("{mins:02}:{rem:02}");
-        self.canvas.draw_text(
-            FontRole::Mono,
-            12.5,
-            34,
-            18,
-            &text,
-            [244, 244, 245, 255],
-        );
+        let text = vexrec_os::format_timer_text(secs);
+        let (tw, _th) = self.canvas.measure_text(FontRole::Mono, 13.0, &text);
+        let tx = ((INDICATOR_W as i32 - tw) / 2).max(8);
+        self.canvas
+            .draw_text(FontRole::Mono, 13.0, tx, 19, &text, text_rgba);
     }
 }

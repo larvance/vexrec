@@ -460,19 +460,39 @@ fn test_settings_controller_and_indicator_pill() {
     settings.hide(&mut backend);
     assert!(!settings.is_visible());
 
-    // IndicatorController dot transitions (red -> paused yellow)
+    // IndicatorController renders outlined timer without any red dot (active vs paused contrast)
     let mut ind = IndicatorController::new(fonts);
     ind.show(&mut backend);
     assert!(ind.is_visible());
-    let rec_dot = backend.pixel_bgra(WindowRole::IndicatorPill, 18, 14).unwrap();
-    assert_eq!(rec_dot, [68, 68, 239, 255], "Expected #ef4444 recording dot in BGRA");
+    let old_dot_spot = backend.pixel_bgra(WindowRole::IndicatorPill, 18, 14).unwrap();
+    assert_ne!(
+        old_dot_spot,
+        [68, 68, 239, 255],
+        "Red circle dot must no longer be drawn on indicator"
+    );
+    let active_outline = backend.pixel_bgra(WindowRole::IndicatorPill, 56, 0).unwrap();
+    assert!(active_outline[3] > 0, "Expected visible top outline stroke");
 
     ind.update(&mut backend, 65, true);
-    let pause_dot = backend.pixel_bgra(WindowRole::IndicatorPill, 18, 14).unwrap();
-    assert_eq!(pause_dot, [8, 179, 234, 255], "Expected paused yellow dot in BGRA");
+    let paused_outline = backend.pixel_bgra(WindowRole::IndicatorPill, 56, 0).unwrap();
+    assert_ne!(
+        paused_outline, active_outline,
+        "Expected paused outline contrast to differ cleanly from active"
+    );
 
     ind.hide(&mut backend);
     assert!(!ind.is_visible());
+
+    let expanded = vexrec_ui::build_output_path(
+        std::path::Path::new("~/Videos/Vexrec"),
+        "Vexrec_{type}_{datetime}",
+        "Recording",
+        "mp4",
+    );
+    assert_eq!(
+        expanded.parent().unwrap(),
+        vexrec_core::xdg::home_dir().join("Videos/Vexrec")
+    );
 }
 
 #[test]

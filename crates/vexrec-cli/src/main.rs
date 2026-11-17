@@ -648,9 +648,5 @@ fn parse_crop_rect(s: &str) -> Option<Rect> {
 }
 
 fn expand_path(p: &Path) -> PathBuf {
-    if let Ok(stripped) = p.strip_prefix("~") {
-        xdg::home_dir().join(stripped)
-    } else {
-        p.to_path_buf()
-    }
+    vexrec_core::expand_tilde(p)
 }

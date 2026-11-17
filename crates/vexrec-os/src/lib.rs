@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod png_enc;
 pub mod shm;
 pub mod simd;
+pub mod tray;
 
 pub use dbus::{
     ensure_portal_screenshot_permission, kwin_capture_workspace_pipe,
@@ -18,3 +19,4 @@ pub use ipc::{
     send_fast_opcode, IpcOpCode,
 };
 pub use shm::ShmBuffer;
+pub use tray::{format_timer_text, format_tray_timer_svg, TrayAction, TrayIndicator};

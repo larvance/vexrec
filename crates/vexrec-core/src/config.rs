@@ -65,6 +65,13 @@ impl VexrecConfig {
         vexrec_path
     }
 
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        let mut cfg: Self =
+            toml::from_str(content).map_err(|e| VexrecError::Config(e.to_string()))?;
+        cfg.normalize_paths();
+        Ok(cfg)
+    }
+
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         if !path.exists() {
@@ -74,7 +81,12 @@ impl VexrecConfig {
         }
 
         let content = std::fs::read_to_string(&path)?;
-        toml::from_str(&content).map_err(|e| VexrecError::Config(e.to_string()))
+        Self::from_toml_str(&content)
+    }
+
+    /// Expands leading `~/` on configured storage directories so daemon saves never treat `~` literally.
+    pub fn normalize_paths(&mut self) {
+        self.storage.expand_paths();
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -240,6 +252,14 @@ pub struct StorageConfig {
     pub screenshot_dir: PathBuf,
     pub recording_dir: PathBuf,
     pub filename_pattern: String,
+}
+
+impl StorageConfig {
+    /// Expands leading `~/` on configured storage directories.
+    pub fn expand_paths(&mut self) {
+        self.screenshot_dir = xdg::expand_tilde(&self.screenshot_dir);
+        self.recording_dir = xdg::expand_tilde(&self.recording_dir);
+    }
 }
 
 impl Default for StorageConfig {
